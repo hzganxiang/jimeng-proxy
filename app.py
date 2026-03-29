@@ -17,7 +17,7 @@ import threading
 import uuid
 from datetime import datetime
 
-app = Flask(__name__, static_folder='static')
+app = Flask(__name__, static_folder='.')
 
 # ============================================
 # 配置
@@ -190,7 +190,7 @@ def wait_for_video(task_id, max_wait=300):
 
 @app.route('/')
 def index():
-    return send_from_directory('static', 'index.html')
+    return send_from_directory('.', 'index.html')
 
 
 @app.route('/health', methods=['GET'])
@@ -431,7 +431,6 @@ def feishu_callback():
 
 
 if __name__ == '__main__':
-    os.makedirs('static', exist_ok=True)
     port = int(os.environ.get("PORT", 8080))
     print(f"🚀 即梦AI v4.1 启动 - 端口: {port}")
     app.run(host="0.0.0.0", port=port)
