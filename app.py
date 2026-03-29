@@ -39,6 +39,10 @@ IMAGE_MODEL = "doubao-seedream-4-0-250828"
 VIDEO_MODEL = "doubao-seedance-1-5-pro-251215"
 VIDEO_DURATION = 5
 
+# 豆包大模型（文案+分镜）
+CHAT_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+CHAT_MODEL = "doubao-pro-32k-241215"
+
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "cli_a94e4446ee7adcce")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "xMNkE0bbPQAKBffUmImCkhIYwV6BK3iQ")
 FEISHU_BOT_WEBHOOK = os.environ.get("FEISHU_BOT_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/d8a5016b-99ac-413a-bba4-3e47d892a1af")
@@ -189,6 +193,167 @@ def send_stats_report():
         [{"tag": "text", "text": f"🖼️ 图片：成功 {s['success_images']}/{s['total_images']}"}],
         [{"tag": "text", "text": f"🎬 视频：成功 {s['success_videos']}/{s['total_videos']}"}]
     ])
+
+# ============================================
+# 豆包大模型：文案 + 分镜
+# ============================================
+
+def chat_completion(system_prompt, user_prompt):
+    """调用豆包大模型"""
+    try:
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {ARK_API_KEY}"}
+        payload = {
+            "model": CHAT_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        }
+        
+        print(f"[豆包] 请求中...")
+        response = requests.post(CHAT_API_ENDPOINT, headers=headers, json=payload, timeout=60)
+        result = response.json()
+        
+        if "choices" in result and len(result["choices"]) > 0:
+            content = result["choices"][0].get("message", {}).get("content", "")
+            print(f"[豆包] 成功，长度: {len(content)}")
+            return {"success": True, "content": content}
+        else:
+            error_msg = result.get("error", {}).get("message", str(result))
+            print(f"[豆包] 失败: {error_msg}")
+            return {"success": False, "error": error_msg}
+    except Exception as e:
+        print(f"[豆包] 异常: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def generate_copywriting(product_name, product_features, style="专业"):
+    """生成营销文案"""
+    system_prompt = """你是一位专业的电商营销文案专家。请根据产品信息生成30秒短视频的营销文案。
+要求：
+1. 文案简洁有力，适合配音朗读
+2. 突出产品卖点和优势
+3. 有吸引力的开头和行动号召结尾
+4. 总字数控制在80-120字"""
+
+    user_prompt = f"""产品名称：{product_name}
+产品特点：{product_features}
+风格：{style}
+
+请生成营销文案："""
+
+    return chat_completion(system_prompt, user_prompt)
+
+
+def generate_storyboard(product_name, copywriting, num_scenes=5):
+    """生成分镜脚本"""
+    system_prompt = """你是一位专业的视频分镜师。请根据产品和文案，生成短视频分镜脚本。
+
+请严格按照以下JSON格式输出，不要添加任何其他内容：
+{
+  "scenes": [
+    {
+      "scene_id": 1,
+      "duration": 5,
+      "description": "镜头描述，用于AI生图",
+      "prompt": "英文提示词，专业产品摄影风格",
+      "narration": "这个镜头对应的旁白文字"
+    }
+  ]
+}
+
+要求：
+1. 每个镜头5秒
+2. description用中文描述画面内容
+3. prompt用英文，适合AI生成产品图片，包含：产品描述、角度、光线、背景、风格
+4. narration是配音文字，从文案中截取"""
+
+    user_prompt = f"""产品名称：{product_name}
+营销文案：{copywriting}
+分镜数量：{num_scenes}个
+
+请生成分镜脚本（JSON格式）："""
+
+    result = chat_completion(system_prompt, user_prompt)
+    
+    if result.get("success"):
+        try:
+            # 提取JSON
+            content = result["content"]
+            # 尝试找到JSON部分
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start >= 0 and end > start:
+                json_str = content[start:end]
+                storyboard = json.loads(json_str)
+                return {"success": True, "storyboard": storyboard}
+            else:
+                return {"success": False, "error": "无法解析JSON", "raw": content}
+        except json.JSONDecodeError as e:
+            return {"success": False, "error": f"JSON解析错误: {e}", "raw": result["content"]}
+    return result
+
+
+def generate_full_video_pipeline(product_name, product_features, style="专业", num_scenes=4):
+    """完整视频生成流水线"""
+    results = {
+        "product_name": product_name,
+        "copywriting": None,
+        "storyboard": None,
+        "scenes": [],
+        "success": False
+    }
+    
+    # Step 1: 生成文案
+    print(f"[流水线] Step 1: 生成文案...")
+    copy_result = generate_copywriting(product_name, product_features, style)
+    if not copy_result.get("success"):
+        results["error"] = f"文案生成失败: {copy_result.get('error')}"
+        return results
+    results["copywriting"] = copy_result["content"]
+    
+    # Step 2: 生成分镜
+    print(f"[流水线] Step 2: 生成分镜...")
+    storyboard_result = generate_storyboard(product_name, results["copywriting"], num_scenes)
+    if not storyboard_result.get("success"):
+        results["error"] = f"分镜生成失败: {storyboard_result.get('error')}"
+        results["raw_storyboard"] = storyboard_result.get("raw", "")
+        return results
+    results["storyboard"] = storyboard_result["storyboard"]
+    
+    # Step 3: 为每个分镜生成图片和视频
+    scenes = results["storyboard"].get("scenes", [])
+    print(f"[流水线] Step 3: 生成 {len(scenes)} 个镜头...")
+    
+    for i, scene in enumerate(scenes):
+        print(f"[流水线] 处理镜头 {i+1}/{len(scenes)}...")
+        scene_result = {
+            "scene_id": scene.get("scene_id", i+1),
+            "description": scene.get("description", ""),
+            "prompt": scene.get("prompt", ""),
+            "narration": scene.get("narration", ""),
+            "image_url": None,
+            "video_url": None
+        }
+        
+        # 生成图片
+        prompt = scene.get("prompt", scene.get("description", ""))
+        img_result = generate_image_internal(prompt)
+        if img_result.get("success"):
+            scene_result["image_url"] = img_result["image_url"]
+            
+            # 生成视频
+            video_prompt = scene.get("description", "产品展示，缓慢旋转")
+            task_result = create_video_task(scene_result["image_url"], video_prompt)
+            if task_result.get("success"):
+                video_result = wait_for_video_completion(task_result["task_id"])
+                if video_result.get("success"):
+                    scene_result["video_url"] = video_result["video_url"]
+        
+        results["scenes"].append(scene_result)
+    
+    results["success"] = True
+    return results
 
 def generate_image_internal(prompt, size="1024x1024"):
     update_stats("total_images")
@@ -381,6 +546,94 @@ def generate_all_api():
             result["video_url"] = video_result.get("video_url") if video_result.get("success") else None
     
     return jsonify(result)
+
+# ============================================
+# 新增：文案/分镜/完整流水线 API
+# ============================================
+
+@app.route('/generate-copy', methods=['POST'])
+def generate_copy_api():
+    """生成营销文案API"""
+    data = request.get_json() or {}
+    product_name = data.get("product_name", "")
+    product_features = data.get("product_features", "")
+    style = data.get("style", "专业")
+    
+    if not product_name:
+        return jsonify({"success": False, "error": "请输入产品名称"}), 400
+    
+    result = generate_copywriting(product_name, product_features, style)
+    return jsonify(result)
+
+
+@app.route('/generate-storyboard', methods=['POST'])
+def generate_storyboard_api():
+    """生成分镜脚本API"""
+    data = request.get_json() or {}
+    product_name = data.get("product_name", "")
+    copywriting = data.get("copywriting", "")
+    num_scenes = data.get("num_scenes", 5)
+    
+    if not product_name or not copywriting:
+        return jsonify({"success": False, "error": "请输入产品名称和文案"}), 400
+    
+    result = generate_storyboard(product_name, copywriting, num_scenes)
+    return jsonify(result)
+
+
+@app.route('/generate-video-pipeline', methods=['POST'])
+def generate_video_pipeline_api():
+    """完整视频生成流水线API
+    
+    输入：
+    - product_name: 产品名称
+    - product_features: 产品特点/卖点
+    - style: 文案风格（默认"专业"）
+    - num_scenes: 分镜数量（默认4）
+    
+    输出：
+    - copywriting: 营销文案
+    - storyboard: 分镜脚本
+    - scenes: 每个镜头的图片和视频URL
+    """
+    data = request.get_json() or {}
+    product_name = data.get("product_name", "")
+    product_features = data.get("product_features", "")
+    style = data.get("style", "专业")
+    num_scenes = data.get("num_scenes", 4)
+    
+    if not product_name:
+        return jsonify({"success": False, "error": "请输入产品名称"}), 400
+    
+    # 发送开始通知
+    send_feishu_message("🎬 视频流水线启动", [
+        [{"tag": "text", "text": f"产品：{product_name}"}],
+        [{"tag": "text", "text": f"分镜数：{num_scenes}"}],
+        [{"tag": "text", "text": "正在生成文案和分镜..."}]
+    ])
+    
+    result = generate_full_video_pipeline(product_name, product_features, style, num_scenes)
+    
+    # 发送结果通知
+    if result.get("success"):
+        scenes_info = []
+        for s in result.get("scenes", []):
+            status = "✅" if s.get("video_url") else ("🖼️" if s.get("image_url") else "❌")
+            scenes_info.append(f"{status} 镜头{s['scene_id']}")
+        
+        send_feishu_message("✅ 视频流水线完成", [
+            [{"tag": "text", "text": f"产品：{product_name}"}],
+            [{"tag": "text", "text": f"文案：{result.get('copywriting', '')[:50]}..."}],
+            [{"tag": "text", "text": f"镜头状态：{' | '.join(scenes_info)}"}]
+        ])
+    else:
+        send_feishu_message("❌ 视频流水线失败", [
+            [{"tag": "text", "text": f"产品：{product_name}"}],
+            [{"tag": "text", "text": f"错误：{result.get('error', '未知错误')}"}]
+        ])
+    
+    return jsonify(result)
+
 
 @app.route('/test-notify', methods=['GET'])
 def test_notify():
