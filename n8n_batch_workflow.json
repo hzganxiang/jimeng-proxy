@@ -1,0 +1,112 @@
+{
+  "name": "即梦AI批量生成工作流",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "trigger",
+      "name": "手动触发",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================\n// 产品列表配置 - 在这里修改你的产品\n// ============================================\nconst products = [\n  {\n    product_id: \"001\",\n    product_name: \"联想笔记本\",\n    prompt: \"一台银色笔记本电脑，薄型设计，专业产品摄影，白色背景，4K高清\",\n    generate_video: true\n  },\n  {\n    product_id: \"002\",\n    product_name: \"机械键盘\",\n    prompt: \"一把黑色机械键盘，RGB灯光效果，电竞风格，专业产品摄影\",\n    generate_video: false\n  },\n  {\n    product_id: \"003\",\n    product_name: \"无线鼠标\",\n    prompt: \"一只白色无线鼠标，简约设计，人体工学，专业产品摄影\",\n    generate_video: true\n  }\n];\n\nreturn products.map(p => ({ json: p }));"
+      },
+      "id": "product-list",
+      "name": "产品列表",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "split-batches",
+      "name": "逐个处理",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://wyzxhy.zeabur.app/generate-all",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ prompt: $json.prompt, generate_video: $json.generate_video }) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "generate-api",
+      "name": "调用生成API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst product = $('产品列表').item.json;\n\nreturn {\n  json: {\n    product_id: product.product_id,\n    product_name: product.product_name,\n    prompt: product.prompt,\n    success: input.success || false,\n    image_url: input.image_url || '',\n    video_url: input.video_url || '',\n    error: input.error || input.error_message || ''\n  }\n};"
+      },
+      "id": "process-result",
+      "name": "处理结果",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 获取所有处理结果\nconst items = $input.all();\nconst results = items.map(item => item.json);\n\n// 统计\nconst total = results.length;\nconst success = results.filter(r => r.success).length;\nconst failed = total - success;\n\n// 构建飞书消息\nlet message_text = `📊 批量生成完成\\n\\n`;\nmessage_text += `✅ 成功: ${success}/${total}\\n`;\nmessage_text += `❌ 失败: ${failed}\\n`;\nmessage_text += `📈 成功率: ${total > 0 ? Math.round(success / total * 100) : 0}%\\n\\n`;\nmessage_text += `--- 详细结果 ---\\n`;\n\nresults.forEach((r, i) => {\n  const status = r.success ? '✅' : '❌';\n  message_text += `${i+1}. ${status} ${r.product_name}\\n`;\n  if (r.success && r.image_url) {\n    message_text += `   图片: 已生成\\n`;\n  }\n  if (r.video_url) {\n    message_text += `   视频: 已生成\\n`;\n  }\n  if (!r.success && r.error) {\n    message_text += `   错误: ${r.error}\\n`;\n  }\n});\n\nreturn {\n  json: {\n    summary: { total, success, failed },\n    results: results,\n    feishu_message: {\n      msg_type: 'text',\n      content: { text: message_text }\n    }\n  }\n};"
+      },
+      "id": "summary",
+      "name": "汇总统计",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://open.feishu.cn/open-apis/bot/v2/hook/d8a5016b-99ac-413a-bba4-3e47d892a1af",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.feishu_message) }}"
+      },
+      "id": "send-report",
+      "name": "发送飞书报告",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 300]
+    }
+  ],
+  "connections": {
+    "手动触发": {
+      "main": [[{"node": "产品列表", "type": "main", "index": 0}]]
+    },
+    "产品列表": {
+      "main": [[{"node": "逐个处理", "type": "main", "index": 0}]]
+    },
+    "逐个处理": {
+      "main": [
+        [{"node": "调用生成API", "type": "main", "index": 0}],
+        [{"node": "汇总统计", "type": "main", "index": 0}]
+      ]
+    },
+    "调用生成API": {
+      "main": [[{"node": "处理结果", "type": "main", "index": 0}]]
+    },
+    "处理结果": {
+      "main": [[{"node": "逐个处理", "type": "main", "index": 0}]]
+    },
+    "汇总统计": {
+      "main": [[{"node": "发送飞书报告", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
