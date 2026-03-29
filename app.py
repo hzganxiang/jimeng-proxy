@@ -36,7 +36,7 @@ IMAGE_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/images/generation
 VIDEO_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
 
 IMAGE_MODEL = "doubao-seedream-4-0-250828"
-VIDEO_MODEL = "doubao-seedance-1-5-pro"
+VIDEO_MODEL = "doubao-seedance-1-5-pro-251215"
 VIDEO_DURATION = 5
 
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "cli_a94e4446ee7adcce")
