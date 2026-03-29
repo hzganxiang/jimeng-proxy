@@ -40,9 +40,9 @@ IMAGE_MODEL = "doubao-seedream-4-0-250828"
 VIDEO_MODEL = "doubao-seedance-1-5-pro-251215"
 VIDEO_DURATION = 5
 
-# 豆包大模型（文案+分镜）
+# 豆包大模型（文案+分镜）- Doubao-Seed-2.0-pro
 CHAT_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-CHAT_MODEL = "doubao-pro-32k-241215"
+CHAT_MODEL = "doubao-seed-2-0-pro-260215"
 
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "cli_a94e4446ee7adcce")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "xMNkE0bbPQAKBffUmImCkhIYwV6BK3iQ")
