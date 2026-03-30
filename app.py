@@ -308,6 +308,25 @@ HTML_PAGE = r'''<!DOCTYPE html>
         .option-item.selected { border-color: #4CAF50; background: rgba(76,175,80,0.2); }
         .option-item .icon { font-size: 20px; margin-bottom: 3px; }
         
+        /* 快速上传框 */
+        .quick-upload-box { width: 60px; height: 60px; border: 2px dashed rgba(255,255,255,0.3); border-radius: 8px; display: flex; flex-direction: column; justify-content: center; align-items: center; cursor: pointer; transition: all 0.3s; color: rgba(255,255,255,0.5); }
+        .quick-upload-box:hover { border-color: #4CAF50; color: #4CAF50; }
+        .quick-ref-item { position: relative; width: 60px; height: 60px; border-radius: 8px; overflow: hidden; }
+        .quick-ref-item img, .quick-ref-item video { width: 100%; height: 100%; object-fit: cover; }
+        .quick-ref-item .remove-btn { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; background: rgba(255,0,0,0.8); color: #fff; border: none; border-radius: 50%; font-size: 12px; cursor: pointer; display: flex; justify-content: center; align-items: center; }
+        
+        /* 分步生成面板 */
+        .step-section { background: rgba(0,0,0,0.2); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+        .step-header { padding: 12px 15px; display: flex; align-items: center; gap: 10px; cursor: pointer; }
+        .step-header:hover { background: rgba(255,255,255,0.05); }
+        .step-badge { width: 24px; height: 24px; background: rgba(76,175,80,0.3); border: 2px solid #4CAF50; border-radius: 50%; display: flex; justify-content: center; align-items: center; font-size: 12px; font-weight: bold; }
+        .step-badge.done { background: #4CAF50; }
+        .step-badge.active { background: #2196F3; border-color: #2196F3; }
+        .step-status { margin-left: auto; font-size: 12px; color: rgba(255,255,255,0.5); }
+        .step-status.done { color: #4CAF50; }
+        .step-status.active { color: #2196F3; }
+        .step-content { padding: 0 15px 15px 15px; }
+        
         /* 图片结果展示 */
         .image-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }
         .image-result-item { background: rgba(0,0,0,0.2); border-radius: 12px; overflow: hidden; }
@@ -321,6 +340,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
         .cost-box { background: linear-gradient(135deg, rgba(255,193,7,0.15), rgba(255,152,0,0.15)); border: 1px solid rgba(255,193,7,0.3); border-radius: 10px; padding: 12px 15px; margin: 15px 0; display: flex; justify-content: space-between; align-items: center; }
         .cost-box .cost-label { color: rgba(255,255,255,0.7); font-size: 13px; }
         .cost-box .cost-value { color: #FFC107; font-weight: bold; font-size: 16px; }
+        .cost-box .free-badge { color: #4CAF50; }
         
         .hidden { display: none !important; }
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 1000; justify-content: center; align-items: center; }
@@ -495,64 +515,193 @@ HTML_PAGE = r'''<!DOCTYPE html>
         
         <!-- ========== 视频生成模式 ========== -->
         <div id="videoMode" class="hidden">
+            <!-- 视频模式选择 -->
             <div class="card">
-                <div class="card-title">🎬 视频生成（完整流程）</div>
-                
-                <div class="section-title">📺 场景类型</div>
-                <div class="option-grid" id="sceneTabs">
-                    <div class="option-item selected" data-scene="product" onclick="selectScene('product')"><div class="icon">🖥️</div>电商产品</div>
-                    <div class="option-item" data-scene="douyin" onclick="selectScene('douyin')"><div class="icon">📱</div>抖音视频</div>
-                    <div class="option-item" data-scene="food" onclick="selectScene('food')"><div class="icon">🍜</div>美食探店</div>
-                    <div class="option-item" data-scene="travel" onclick="selectScene('travel')"><div class="icon">✈️</div>旅游风景</div>
-                    <div class="option-item" data-scene="custom" onclick="selectScene('custom')"><div class="icon">✨</div>自定义</div>
-                </div>
-                
-                <div class="form-group">
-                    <label id="videoInputLabel">产品名称 *</label>
-                    <input type="text" id="videoMainInput" placeholder="例如：联想小新Pro16笔记本">
-                </div>
-                <div class="form-group">
-                    <label>详细描述</label>
-                    <textarea id="videoDetailInput" placeholder="例如：16英寸2.5K屏，i7处理器，性能强劲"></textarea>
-                </div>
-                
-                <div class="section-title">⚙️ 生成设置</div>
-                <div class="form-row-3">
-                    <div class="form-group">
-                        <label>镜头数量</label>
-                        <select id="videoScenes">
-                            <option value="3">3个镜头</option>
-                            <option value="4" selected>4个镜头</option>
-                            <option value="5">5个镜头</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>视频时长</label>
-                        <select id="videoDuration">
-                            <option value="5" selected>5秒/镜头</option>
-                            <option value="10">10秒/镜头</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>生成模式</label>
-                        <select id="videoGenMode">
-                            <option value="full">图片+视频</option>
-                            <option value="imageOnly">只生成图片</option>
-                        </select>
-                    </div>
-                </div>
-                
-                <div class="cost-box">
-                    <span class="cost-label">预估费用</span>
-                    <span class="cost-value" id="videoCost">¥4.40</span>
-                </div>
-                
-                <div class="btn-group">
-                    <button class="btn btn-primary" onclick="generateVideo()">🚀 开始生成</button>
+                <div class="option-grid" style="grid-template-columns: 1fr 1fr;">
+                    <div class="option-item selected" data-vmode="quick" onclick="selectVideoSubMode('quick')"><div class="icon">⚡</div>快速视频</div>
+                    <div class="option-item" data-vmode="full" onclick="selectVideoSubMode('full')"><div class="icon">📝</div>完整流程</div>
                 </div>
             </div>
             
-            <!-- 视频生成进度 -->
+            <!-- ===== 快速视频模式（类似即梦） ===== -->
+            <div id="quickVideoMode">
+                <div class="card">
+                    <div class="card-title">🎬 快速视频生成</div>
+                    
+                    <!-- 参考素材上传 -->
+                    <div class="section-title">📤 参考素材（可选，最多5张）</div>
+                    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:15px;" id="quickRefContainer">
+                        <div class="quick-upload-box" onclick="document.getElementById('quickRefInput').click()">
+                            <div style="font-size:24px;">+</div>
+                            <div style="font-size:12px;">添加</div>
+                        </div>
+                        <input type="file" id="quickRefInput" accept="image/*,video/*" multiple style="display:none" onchange="handleQuickRefUpload(event)">
+                    </div>
+                    <div id="quickRefPreviewList" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:15px;"></div>
+                    
+                    <!-- 简洁输入框 -->
+                    <div class="form-group">
+                        <textarea id="quickVideoPrompt" placeholder="描述你想要的视频效果...&#10;例如：产品缓缓旋转，光影流动，展现科技质感" style="min-height:80px;"></textarea>
+                    </div>
+                    
+                    <!-- 底部选项栏 -->
+                    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:15px;">
+                        <select id="quickVideoModel" style="flex:1;min-width:150px;">
+                            <option value="jimeng-video-seedance-2.0">Seedance 2.0</option>
+                            <option value="jimeng-video-seedance-2.0-fast">Seedance 2.0 Fast</option>
+                        </select>
+                        <select id="quickVideoRatio" style="width:80px;">
+                            <option value="16:9">16:9</option>
+                            <option value="9:16">9:16</option>
+                            <option value="1:1">1:1</option>
+                            <option value="4:3">4:3</option>
+                            <option value="3:4">3:4</option>
+                        </select>
+                        <select id="quickVideoDuration" style="width:80px;">
+                            <option value="5">5秒</option>
+                            <option value="10">10秒</option>
+                            <option value="15">15秒</option>
+                        </select>
+                    </div>
+                    
+                    <div class="cost-box">
+                        <span class="cost-label">预估费用</span>
+                        <span class="cost-value free-badge">免费 ✨</span>
+                    </div>
+                    
+                    <div class="btn-group">
+                        <button class="btn btn-primary" onclick="generateQuickVideo()">🚀 生成视频</button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- ===== 完整流程模式 ===== -->
+            <div id="fullVideoMode" class="hidden">
+                <div class="card">
+                    <div class="card-title">📝 完整流程（文案→分镜→图片→视频）</div>
+                    
+                    <div class="section-title">📺 场景类型</div>
+                    <div class="option-grid" id="sceneTabs">
+                        <div class="option-item selected" data-scene="product" onclick="selectScene('product')"><div class="icon">🖥️</div>电商产品</div>
+                        <div class="option-item" data-scene="douyin" onclick="selectScene('douyin')"><div class="icon">📱</div>抖音视频</div>
+                        <div class="option-item" data-scene="food" onclick="selectScene('food')"><div class="icon">🍜</div>美食探店</div>
+                        <div class="option-item" data-scene="travel" onclick="selectScene('travel')"><div class="icon">✈️</div>旅游风景</div>
+                        <div class="option-item" data-scene="custom" onclick="selectScene('custom')"><div class="icon">✨</div>自定义</div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label id="videoInputLabel">产品名称 *</label>
+                        <input type="text" id="videoMainInput" placeholder="例如：联想小新Pro16笔记本">
+                    </div>
+                    <div class="form-group">
+                        <label>详细描述</label>
+                        <textarea id="videoDetailInput" placeholder="例如：16英寸2.5K屏，i7处理器，性能强劲"></textarea>
+                    </div>
+                    
+                    <div class="section-title">⚙️ 生成设置</div>
+                    <div class="form-row-3">
+                        <div class="form-group">
+                            <label>镜头数量</label>
+                            <select id="videoScenes">
+                                <option value="3">3个镜头</option>
+                                <option value="4" selected>4个镜头</option>
+                                <option value="5">5个镜头</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>视频时长</label>
+                            <select id="videoDuration">
+                                <option value="5" selected>5秒/镜头</option>
+                                <option value="10">10秒/镜头</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>生成模式</label>
+                            <select id="videoGenMode">
+                                <option value="full">图片+视频</option>
+                                <option value="imageOnly">只生成图片</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div class="cost-box">
+                        <span class="cost-label">预估费用</span>
+                        <span class="cost-value free-badge">免费 ✨</span>
+                    </div>
+                    
+                    <div class="btn-group" style="flex-direction:column;gap:10px;">
+                        <button class="btn btn-primary" onclick="generateVideoOneClick()" style="width:100%;">⚡ 一键生成（全自动）</button>
+                        <button class="btn btn-secondary" onclick="generateVideoStepByStep()" style="width:100%;">📋 一步步生成（可修改）</button>
+                    </div>
+                </div>
+                
+                <!-- 分步生成面板 -->
+                <div class="card hidden" id="stepByStepPanel">
+                    <div class="card-title">📋 分步生成</div>
+                    
+                    <!-- 步骤1：文案 -->
+                    <div class="step-section" id="step1">
+                        <div class="step-header">
+                            <span class="step-badge">1</span>
+                            <span>文案生成</span>
+                            <span class="step-status" id="step1Status">⏳ 待生成</span>
+                        </div>
+                        <div class="step-content hidden" id="step1Content">
+                            <textarea id="stepCopyResult" style="min-height:100px;" placeholder="文案将在这里显示，你可以修改..."></textarea>
+                            <div class="btn-group" style="margin-top:10px;">
+                                <button class="btn btn-secondary btn-small" onclick="regenerateStep(1)">🔄 重新生成</button>
+                                <button class="btn btn-primary btn-small" onclick="confirmStep(1)">✓ 确认，下一步</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 步骤2：分镜 -->
+                    <div class="step-section" id="step2">
+                        <div class="step-header">
+                            <span class="step-badge">2</span>
+                            <span>分镜脚本</span>
+                            <span class="step-status" id="step2Status">⏳ 待生成</span>
+                        </div>
+                        <div class="step-content hidden" id="step2Content">
+                            <div id="stepStoryboardResult"></div>
+                            <div class="btn-group" style="margin-top:10px;">
+                                <button class="btn btn-secondary btn-small" onclick="regenerateStep(2)">🔄 重新生成</button>
+                                <button class="btn btn-primary btn-small" onclick="confirmStep(2)">✓ 确认，下一步</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 步骤3：图片 -->
+                    <div class="step-section" id="step3">
+                        <div class="step-header">
+                            <span class="step-badge">3</span>
+                            <span>图片生成</span>
+                            <span class="step-status" id="step3Status">⏳ 待生成</span>
+                        </div>
+                        <div class="step-content hidden" id="step3Content">
+                            <div class="image-results" id="stepImageResult"></div>
+                            <div class="btn-group" style="margin-top:10px;">
+                                <button class="btn btn-secondary btn-small" onclick="regenerateStep(3)">🔄 重新生成</button>
+                                <button class="btn btn-primary btn-small" onclick="confirmStep(3)">✓ 确认，生成视频</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 步骤4：视频 -->
+                    <div class="step-section" id="step4">
+                        <div class="step-header">
+                            <span class="step-badge">4</span>
+                            <span>视频生成</span>
+                            <span class="step-status" id="step4Status">⏳ 待生成</span>
+                        </div>
+                        <div class="step-content hidden" id="step4Content">
+                            <div class="image-results" id="stepVideoResult"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 视频生成进度（一键生成用） -->
             <div class="card hidden" id="videoProgress">
                 <div class="card-title">⏳ 生成中...</div>
                 <div id="videoStatusList"></div>
@@ -563,13 +712,14 @@ HTML_PAGE = r'''<!DOCTYPE html>
             <!-- 视频结果 -->
             <div class="card hidden" id="videoResults">
                 <div class="card-title">🎉 生成完成！</div>
-                <div class="form-group">
+                <div class="form-group" id="videoCopySection">
                     <label>📝 文案</label>
                     <div style="background:rgba(0,0,0,0.2);border-radius:8px;padding:15px;white-space:pre-wrap;" id="videoCopyResult"></div>
                 </div>
                 <div class="image-results" id="videoResultGrid"></div>
                 <div class="btn-group">
                     <button class="btn btn-secondary" onclick="downloadAllVideos()">📥 全部下载</button>
+                    <button class="btn btn-secondary" onclick="sendVideosToFeishu()">📤 发飞书</button>
                     <button class="btn btn-primary" onclick="resetVideoMode()">✨ 新建</button>
                 </div>
             </div>
@@ -919,6 +1069,35 @@ HTML_PAGE = r'''<!DOCTYPE html>
             }
         }
         
+        async function sendVideosToFeishu() {
+            var copy = document.getElementById('videoCopyResult').innerText || '';
+            var msg = '🎬 AI生成视频\n\n';
+            if (copy) msg += '📝 文案:\n' + copy.substring(0, 200) + '\n\n';
+            
+            // 收集所有视频和图片链接
+            var results = document.querySelectorAll('#videoResultGrid .image-result-item');
+            results.forEach(function(item, i) {
+                var video = item.querySelector('video');
+                var img = item.querySelector('img');
+                if (video && video.src) {
+                    msg += '🎬 镜头' + (i+1) + ': ' + video.src + '\n';
+                } else if (img && img.src) {
+                    msg += '🖼️ 镜头' + (i+1) + ': ' + img.src + '\n';
+                }
+            });
+            
+            try {
+                await fetch('/api/notify', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ message: msg })
+                });
+                alert('已发送到飞书！');
+            } catch(e) {
+                alert('发送失败');
+            }
+        }
+        
         function resetImageMode() {
             document.getElementById('imgProgress').classList.add('hidden');
             document.getElementById('imgResults').classList.add('hidden');
@@ -938,6 +1117,248 @@ HTML_PAGE = r'''<!DOCTYPE html>
         }
         
         // ========== 视频生成模式 ==========
+        var currentVideoSubMode = 'quick';
+        var quickRefFiles = [];
+        var stepData = { copy: '', storyboard: [], images: [], videos: [] };
+        
+        function selectVideoSubMode(mode) {
+            currentVideoSubMode = mode;
+            document.querySelectorAll('[data-vmode]').forEach(t => t.classList.remove('selected'));
+            document.querySelector('[data-vmode="'+mode+'"]').classList.add('selected');
+            document.getElementById('quickVideoMode').classList.toggle('hidden', mode !== 'quick');
+            document.getElementById('fullVideoMode').classList.toggle('hidden', mode !== 'full');
+            document.getElementById('videoProgress').classList.add('hidden');
+            document.getElementById('videoResults').classList.add('hidden');
+        }
+        
+        // 快速视频 - 参考素材上传
+        function handleQuickRefUpload(e) {
+            var files = Array.from(e.target.files);
+            files.forEach(function(file) {
+                if (quickRefFiles.length >= 5) return;
+                quickRefFiles.push(file);
+                var reader = new FileReader();
+                reader.onload = function(ev) {
+                    var preview = document.getElementById('quickRefPreviewList');
+                    var item = document.createElement('div');
+                    item.className = 'quick-ref-item';
+                    item.dataset.index = quickRefFiles.length - 1;
+                    if (file.type.startsWith('video/')) {
+                        item.innerHTML = '<video src="'+ev.target.result+'" muted></video><button class="remove-btn" onclick="removeQuickRef('+item.dataset.index+')">×</button>';
+                    } else {
+                        item.innerHTML = '<img src="'+ev.target.result+'"><button class="remove-btn" onclick="removeQuickRef('+item.dataset.index+')">×</button>';
+                    }
+                    preview.appendChild(item);
+                };
+                reader.readAsDataURL(file);
+            });
+            e.target.value = '';
+        }
+        
+        function removeQuickRef(index) {
+            quickRefFiles.splice(index, 1);
+            renderQuickRefPreviews();
+        }
+        
+        function renderQuickRefPreviews() {
+            var preview = document.getElementById('quickRefPreviewList');
+            preview.innerHTML = '';
+            quickRefFiles.forEach(function(file, i) {
+                var reader = new FileReader();
+                reader.onload = function(ev) {
+                    var item = document.createElement('div');
+                    item.className = 'quick-ref-item';
+                    if (file.type.startsWith('video/')) {
+                        item.innerHTML = '<video src="'+ev.target.result+'" muted></video><button class="remove-btn" onclick="removeQuickRef('+i+')">×</button>';
+                    } else {
+                        item.innerHTML = '<img src="'+ev.target.result+'"><button class="remove-btn" onclick="removeQuickRef('+i+')">×</button>';
+                    }
+                    preview.appendChild(item);
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+        
+        // 快速视频生成
+        async function generateQuickVideo() {
+            var prompt = document.getElementById('quickVideoPrompt').value.trim();
+            if (!prompt) { alert('请输入视频描述'); return; }
+            
+            var model = document.getElementById('quickVideoModel').value;
+            var ratio = document.getElementById('quickVideoRatio').value;
+            var duration = parseInt(document.getElementById('quickVideoDuration').value);
+            
+            document.getElementById('quickVideoMode').querySelector('.btn-primary').disabled = true;
+            document.getElementById('quickVideoMode').querySelector('.btn-primary').textContent = '⏳ 生成中...';
+            document.getElementById('videoProgress').classList.remove('hidden');
+            document.getElementById('videoProgressText').textContent = '正在生成视频（约1-3分钟）...';
+            document.getElementById('videoProgressBar').style.width = '30%';
+            
+            try {
+                // TODO: 如果有参考图，先上传
+                var imageUrl = null;
+                // 暂时简化，直接文生视频
+                
+                var resp = await fetch('/api/generate-video', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        prompt: prompt,
+                        duration: duration,
+                        image_url: imageUrl  // 可选首帧
+                    })
+                });
+                var data = await resp.json();
+                
+                if (data.success && data.video_url) {
+                    document.getElementById('videoProgressBar').style.width = '100%';
+                    videoData = { copywriting: '', scenes: [{ video: data.video_url, image: null }] };
+                    document.getElementById('videoCopySection').classList.add('hidden');
+                    showVideoResults();
+                } else {
+                    throw new Error(data.error || '生成失败');
+                }
+            } catch(e) {
+                alert('生成失败: ' + e.message);
+                document.getElementById('videoProgress').classList.add('hidden');
+            } finally {
+                document.getElementById('quickVideoMode').querySelector('.btn-primary').disabled = false;
+                document.getElementById('quickVideoMode').querySelector('.btn-primary').textContent = '🚀 生成视频';
+            }
+        }
+        
+        // 完整流程 - 一键生成
+        async function generateVideoOneClick() {
+            var name = document.getElementById('videoMainInput').value.trim();
+            if (!name) { alert('请输入主题'); return; }
+            
+            document.getElementById('fullVideoMode').classList.add('hidden');
+            document.getElementById('stepByStepPanel').classList.add('hidden');
+            await generateVideo();
+        }
+        
+        // 完整流程 - 一步步生成
+        async function generateVideoStepByStep() {
+            var name = document.getElementById('videoMainInput').value.trim();
+            if (!name) { alert('请输入主题'); return; }
+            
+            document.getElementById('stepByStepPanel').classList.remove('hidden');
+            stepData = { copy: '', storyboard: [], images: [], videos: [] };
+            
+            // 重置所有步骤状态
+            for (var i = 1; i <= 4; i++) {
+                document.getElementById('step'+i+'Status').textContent = '⏳ 待生成';
+                document.getElementById('step'+i+'Status').className = 'step-status';
+                document.getElementById('step'+i+'Content').classList.add('hidden');
+            }
+            
+            // 开始步骤1
+            await runStep(1);
+        }
+        
+        async function runStep(step) {
+            var name = document.getElementById('videoMainInput').value.trim();
+            var detail = document.getElementById('videoDetailInput').value.trim();
+            var numScenes = parseInt(document.getElementById('videoScenes').value);
+            var duration = parseInt(document.getElementById('videoDuration').value);
+            
+            document.getElementById('step'+step+'Status').textContent = '🔄 生成中...';
+            document.getElementById('step'+step+'Status').className = 'step-status active';
+            
+            try {
+                if (step === 1) {
+                    // 生成文案
+                    var resp = await fetch('/api/generate-copy', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ product_name: name, product_features: detail, scene_type: currentScene })
+                    });
+                    var data = await resp.json();
+                    if (!data.success) throw new Error(data.error);
+                    stepData.copy = data.content;
+                    document.getElementById('stepCopyResult').value = stepData.copy;
+                    
+                } else if (step === 2) {
+                    // 生成分镜
+                    var resp = await fetch('/api/generate-storyboard', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ product_name: name, copywriting: stepData.copy, num_scenes: numScenes })
+                    });
+                    var data = await resp.json();
+                    if (!data.success) throw new Error(data.error);
+                    stepData.storyboard = (data.storyboard && data.storyboard.scenes) ? data.storyboard.scenes : [];
+                    
+                    var html = '';
+                    stepData.storyboard.forEach(function(s, i) {
+                        html += '<div style="background:rgba(0,0,0,0.2);padding:10px;border-radius:8px;margin-bottom:8px;"><strong>镜头'+(i+1)+'</strong><br><small style="color:rgba(255,255,255,0.6);">'+s.image_prompt.substring(0,80)+'...</small></div>';
+                    });
+                    document.getElementById('stepStoryboardResult').innerHTML = html;
+                    
+                } else if (step === 3) {
+                    // 生成图片
+                    stepData.images = [];
+                    for (var i = 0; i < stepData.storyboard.length; i++) {
+                        var resp = await fetch('/api/generate-images', {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ prompt: stepData.storyboard[i].image_prompt, count: 1, size: '1920x1080' })
+                        });
+                        var data = await resp.json();
+                        var imgUrl = (data.images && data.images[0]) ? data.images[0].url : null;
+                        stepData.images.push(imgUrl);
+                    }
+                    
+                    var html = '';
+                    stepData.images.forEach(function(url, i) {
+                        if (url) {
+                            html += '<div class="image-result-item" style="max-width:150px;"><img src="'+url+'" onclick="openModal(\''+url+'\')"><div class="img-info"><span>镜头'+(i+1)+'</span></div></div>';
+                        }
+                    });
+                    document.getElementById('stepImageResult').innerHTML = html || '<p>生成失败</p>';
+                    
+                } else if (step === 4) {
+                    // 生成视频
+                    stepData.videos = [];
+                    for (var i = 0; i < stepData.images.length; i++) {
+                        if (!stepData.images[i]) { stepData.videos.push(null); continue; }
+                        var resp = await fetch('/api/generate-video', {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ image_url: stepData.images[i], prompt: stepData.storyboard[i].video_prompt || 'smooth movement', duration: duration })
+                        });
+                        var data = await resp.json();
+                        stepData.videos.push(data.success ? data.video_url : null);
+                    }
+                    
+                    var html = '';
+                    stepData.videos.forEach(function(url, i) {
+                        if (url) {
+                            html += '<div class="image-result-item"><video src="'+url+'" controls style="width:100%;"></video><div class="img-info"><span>镜头'+(i+1)+'</span></div></div>';
+                        }
+                    });
+                    document.getElementById('stepVideoResult').innerHTML = html || '<p>生成失败</p>';
+                }
+                
+                document.getElementById('step'+step+'Status').textContent = '✅ 完成';
+                document.getElementById('step'+step+'Status').className = 'step-status done';
+                document.getElementById('step'+step+'Content').classList.remove('hidden');
+                
+            } catch(e) {
+                document.getElementById('step'+step+'Status').textContent = '❌ 失败';
+                alert('步骤'+step+'失败: ' + e.message);
+            }
+        }
+        
+        async function regenerateStep(step) {
+            await runStep(step);
+        }
+        
+        async function confirmStep(step) {
+            if (step === 1) {
+                stepData.copy = document.getElementById('stepCopyResult').value;
+            }
+            if (step < 4) {
+                await runStep(step + 1);
+            }
+        }
+        
         function selectScene(scene) {
             currentScene = scene;
             document.querySelectorAll('#sceneTabs .option-item').forEach(t => t.classList.remove('selected'));
@@ -949,11 +1370,8 @@ HTML_PAGE = r'''<!DOCTYPE html>
         }
         
         function updateVideoCost() {
-            var scenes = parseInt(document.getElementById('videoScenes').value);
-            var duration = parseInt(document.getElementById('videoDuration').value);
-            var mode = document.getElementById('videoGenMode').value;
-            // 图片和视频都免费了！只有文案生成需要极少费用
-            document.getElementById('videoCost').textContent = '免费 ✨ (文案~¥0.01)';
+            // 费用显示已经直接在HTML设置为免费，无需动态更新
+            // 保留函数避免事件监听器报错
         }
         
         async function generateVideo() {
@@ -991,7 +1409,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
                 });
                 data = await resp.json();
                 if (!data.success) throw new Error(data.error);
-                var storyboard = data.storyboard.scenes || [];
+                var storyboard = (data.storyboard && data.storyboard.scenes) ? data.storyboard.scenes : [];
                 
                 // 3. 生成图片
                 videoData.scenes = [];
@@ -1062,7 +1480,16 @@ HTML_PAGE = r'''<!DOCTYPE html>
             document.getElementById('videoResults').classList.add('hidden');
             document.getElementById('videoMainInput').value = '';
             document.getElementById('videoDetailInput').value = '';
+            document.getElementById('quickVideoPrompt').value = '';
+            document.getElementById('stepByStepPanel').classList.add('hidden');
+            document.getElementById('quickVideoMode').classList.remove('hidden');
+            document.getElementById('fullVideoMode').classList.add('hidden');
+            document.getElementById('videoCopySection').classList.remove('hidden');
             videoData = { copywriting: '', scenes: [] };
+            stepData = { copy: '', storyboard: [], images: [], videos: [] };
+            quickRefFiles = [];
+            document.getElementById('quickRefPreviewList').innerHTML = '';
+            selectVideoSubMode('quick');
         }
         
         // ========== 通用功能 ==========
