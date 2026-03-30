@@ -1,7 +1,10 @@
 """
-即梦AI Flask代理服务 v6.2
+即梦AI Flask代理服务 v7.0
 ===========================
-新增：图生图功能（支持参考图上传）
+重大更新：改用即梦免费API，支持多账号轮询
+- 图片生成：免费（66次/天/账号）
+- 视频生成：免费（66次/天/账号）
+- 文案/分镜：继续使用火山方舟（极便宜）
 """
 
 from flask import Flask, request, jsonify, Response
@@ -14,23 +17,30 @@ import threading
 
 app = Flask(__name__)
 
-# 配置
-ARK_API_KEY = os.environ.get("ARK_API_KEY", "5adb80da-3c5f-4ea4-99d8-e73e78899ba7")
-IMAGE_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
-VIDEO_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
-CHAT_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+# ========== 即梦免费API配置 ==========
+# 部署后填入你的即梦免费API地址
+JIMENG_FREE_API = os.environ.get("JIMENG_FREE_API", "https://你的jimeng-api.zeabur.app")
+# 多个sessionid用逗号分隔
+JIMENG_SESSION_IDS = os.environ.get("JIMENG_SESSION_IDS", "sessionid1,sessionid2,sessionid3")
 
-IMAGE_MODEL = "doubao-seedream-4-0-250828"
-VIDEO_MODEL = "doubao-seedance-1-5-pro-251215"
+# 即梦免费API模型
+JIMENG_IMAGE_MODEL = "jimeng-5.0"  # 最新图片模型
+JIMENG_VIDEO_MODEL = "jimeng-video-seedance-2.0"  # 视频模型
+
+# ========== 火山方舟配置（仅用于文案/分镜，极便宜） ==========
+ARK_API_KEY = os.environ.get("ARK_API_KEY", "5adb80da-3c5f-4ea4-99d8-e73e78899ba7")
+CHAT_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 CHAT_MODEL = "doubao-1-5-pro-32k-250115"
 
+# ========== 飞书配置 ==========
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "cli_a94e4446ee7adcce")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "xMNkE0bbPQAKBffUmImCkhIYwV6BK3iQ")
 FEISHU_BOT_WEBHOOK = os.environ.get("FEISHU_BOT_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/d8a5016b-99ac-413a-bba4-3e47d892a1af")
 
-PRICE_IMAGE = 0.20
-PRICE_VIDEO_5S = 0.50
-PRICE_VIDEO_10S = 1.00
+# 费用（现在是免费的！）
+PRICE_IMAGE = 0.00
+PRICE_VIDEO_5S = 0.00
+PRICE_VIDEO_10S = 0.00
 
 projects = {}
 
@@ -71,66 +81,150 @@ def chat_completion(system_prompt, user_prompt):
         return {"success": False, "error": str(e)}
 
 def generate_image(prompt, size="1024x1024", ref_image=None):
-    """生成图片，支持文生图和图生图
+    """生成图片，调用即梦免费API
     Args:
         prompt: 提示词
-        size: 图片尺寸
-        ref_image: 参考图URL（可选，提供则为图生图模式）
+        size: 图片尺寸（会转换为ratio格式）
+        ref_image: 参考图（URL或Base64，可选）
     """
     try:
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {ARK_API_KEY}"}
-        payload = {"model": IMAGE_MODEL, "prompt": prompt, "size": size, "response_format": "url", "watermark": False}
+        # 转换尺寸为ratio格式
+        size_to_ratio = {
+            "1024x1024": "1:1", "1440x1440": "1:1", "2048x2048": "1:1",
+            "1440x1920": "3:4", "1080x1440": "3:4",
+            "1920x1440": "4:3", "1440x1080": "4:3",
+            "1080x1920": "9:16", "720x1280": "9:16",
+            "1920x1080": "16:9", "1280x720": "16:9",
+        }
+        ratio = size_to_ratio.get(size, "1:1")
         
-        # 图生图模式：添加参考图
+        # 转换尺寸为resolution格式
+        total_pixels = 1
+        if 'x' in size:
+            w, h = map(int, size.split('x'))
+            total_pixels = w * h
+        resolution = "2k" if total_pixels >= 2000000 else "1k"
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {JIMENG_SESSION_IDS}"
+        }
+        
+        # 图生图模式
         if ref_image:
-            payload["image"] = ref_image
-            print(f"[图生图] 尺寸:{size} 参考图:{ref_image[:50]}... 提示:{prompt[:30]}...")
+            # 处理Base64格式
+            if ref_image.startswith('data:'):
+                if ';base64,' in ref_image:
+                    ref_image = ref_image.split(';base64,')[1]
+            
+            payload = {
+                "model": JIMENG_IMAGE_MODEL,
+                "prompt": prompt,
+                "images": [ref_image] if ref_image.startswith('http') else [],
+                "ratio": ratio,
+                "resolution": resolution
+            }
+            # Base64图片需要用multipart，这里简化处理，只支持URL
+            if not ref_image.startswith('http'):
+                print(f"[图生图] 警告：Base64图片暂不支持，尝试文生图")
+                payload.pop("images", None)
+            else:
+                print(f"[图生图] ratio:{ratio} resolution:{resolution}")
         else:
-            print(f"[文生图] 尺寸:{size} 提示:{prompt[:50]}...")
+            payload = {
+                "model": JIMENG_IMAGE_MODEL,
+                "prompt": prompt,
+                "ratio": ratio,
+                "resolution": resolution
+            }
+            print(f"[文生图] ratio:{ratio} resolution:{resolution} 提示:{prompt[:30]}...")
         
-        response = requests.post(IMAGE_API_ENDPOINT, headers=headers, json=payload, timeout=120)
+        # 调用即梦免费API
+        api_url = f"{JIMENG_FREE_API}/v1/images/generations"
+        response = requests.post(api_url, headers=headers, json=payload, timeout=120)
         result = response.json()
+        
+        # 解析响应（OpenAI兼容格式）
         if "data" in result and len(result["data"]) > 0:
-            return {"success": True, "image_url": result["data"][0].get("url", "")}
-        return {"success": False, "error": result.get("error", {}).get("message", str(result))}
+            image_url = result["data"][0].get("url", "")
+            return {"success": True, "image_url": image_url}
+        elif "error" in result:
+            return {"success": False, "error": result["error"].get("message", str(result))}
+        else:
+            return {"success": False, "error": str(result)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def create_video_task(image_url, prompt, duration=5, resolution="1080p"):
+def generate_video_jimeng(prompt, image_url=None, duration=5):
+    """生成视频，调用即梦免费API
+    Args:
+        prompt: 视频描述
+        image_url: 首帧图片URL（可选）
+        duration: 视频时长（秒）
+    """
     try:
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {ARK_API_KEY}"}
-        payload = {"model": VIDEO_MODEL, "content": [{"type": "image_url", "image_url": {"url": image_url}, "role": "first_frame"}, {"type": "text", "text": prompt}], "duration": duration, "resolution": resolution}
-        response = requests.post(VIDEO_API_ENDPOINT, headers=headers, json=payload, timeout=30)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {JIMENG_SESSION_IDS}"
+        }
+        
+        payload = {
+            "model": JIMENG_VIDEO_MODEL,
+            "prompt": prompt,
+            "ratio": "16:9",
+            "resolution": "720p",
+            "duration": min(duration, 10)  # 即梦免费版最长10秒
+        }
+        
+        # 如果有首帧图片
+        if image_url:
+            payload["file_paths"] = [image_url]
+        
+        print(f"[视频生成] 时长:{duration}s 提示:{prompt[:30]}...")
+        
+        # 调用即梦免费API
+        api_url = f"{JIMENG_FREE_API}/v1/videos/generations"
+        response = requests.post(api_url, headers=headers, json=payload, timeout=300)
         result = response.json()
-        return {"success": True, "task_id": result["id"]} if "id" in result else {"success": False, "error": result.get("error", {}).get("message", str(result))}
+        
+        # 解析响应
+        if "data" in result and len(result["data"]) > 0:
+            video_url = result["data"][0].get("url", "")
+            return {"success": True, "video_url": video_url}
+        elif "error" in result:
+            return {"success": False, "error": result["error"].get("message", str(result))}
+        else:
+            return {"success": False, "error": str(result)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+# 保留旧函数名兼容性（即梦免费API是同步返回的）
+def create_video_task(image_url, prompt, duration=5, resolution="1080p"):
+    """兼容旧接口，直接调用即梦免费API并返回结果"""
+    result = generate_video_jimeng(prompt, image_url, duration)
+    if result.get("success"):
+        # 返回video_url作为task_id，wait_for_video会直接返回它
+        return {"success": True, "task_id": result.get("video_url", "")}
+    else:
+        return result
 
 def query_video_task(task_id):
-    try:
-        response = requests.get(f"{VIDEO_API_ENDPOINT}/{task_id}", headers={"Authorization": f"Bearer {ARK_API_KEY}"}, timeout=30)
-        return response.json()
-    except: return {"error": "查询失败"}
+    """即梦免费API是同步的，不需要查询"""
+    return {"status": "succeeded"}
 
 def wait_for_video(task_id, max_wait=600):
-    start = time.time()
-    while time.time() - start < max_wait:
-        result = query_video_task(task_id)
-        status = result.get("status", "")
-        if status == "succeeded":
-            video_url = result.get("content", {}).get("video_url") or result.get("content", {}).get("url") or result.get("video_url")
-            return {"success": True, "video_url": video_url} if video_url else {"success": False, "error": "无URL"}
-        elif status in ["failed", "cancelled"]:
-            return {"success": False, "error": f"任务{status}"}
-        time.sleep(5)
-    return {"success": False, "error": "超时"}
+    """即梦免费API是同步的，task_id就是video_url"""
+    if task_id:
+        return {"success": True, "video_url": task_id}
+    else:
+        return {"success": False, "error": "无视频URL"}
 
 HTML_PAGE = r'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI创作工具 v6.2</title>
+    <title>AI创作工具 v7.0 免费版</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); min-height: 100vh; color: #fff; }
@@ -138,6 +232,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
         .header { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; border-bottom: 1px solid rgba(255,255,255,0.1); margin-bottom: 20px; }
         .header h1 { font-size: 22px; }
         .version { font-size: 12px; background: #4CAF50; padding: 2px 8px; border-radius: 10px; margin-left: 8px; }
+        .free-badge { font-size: 12px; background: linear-gradient(135deg, #FFD700, #FFA500); color: #000; padding: 2px 8px; border-radius: 10px; margin-left: 5px; font-weight: bold; }
         
         /* 主Tab切换 */
         .main-tabs { display: flex; gap: 0; margin-bottom: 25px; background: rgba(255,255,255,0.05); border-radius: 12px; padding: 5px; }
@@ -205,7 +300,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🎨 AI创作工具 <span class="version">v6.2</span></h1>
+            <h1>🎨 AI创作工具 <span class="version">v7.0</span><span class="free-badge">🆓 免费</span></h1>
             <button class="btn btn-secondary btn-small" onclick="showHistory()">📋 历史</button>
         </div>
         
@@ -243,7 +338,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
                             <div>点击上传参考图片</div>
                             <div style="font-size:12px;color:rgba(255,255,255,0.5);margin-top:5px;">支持 JPG、PNG 格式</div>
                         </div>
-                        <img id="refImagePreview" style="max-width:200px;max-height:150px;border-radius:8px;display:none;">
+                        <img id="refImagePreview" style="max-width:200px;max-height:150px;border-radius:8px;display:none;" onerror="handleRefImageError()">
                     </div>
                     <div class="form-group" style="margin-bottom:10px;">
                         <label>或输入图片URL</label>
@@ -547,7 +642,22 @@ HTML_PAGE = r'''<!DOCTYPE html>
                 document.getElementById('refImagePreview').style.display = 'block';
                 document.getElementById('refUploadText').style.display = 'none';
                 document.getElementById('refUploadArea').style.borderColor = '#4CAF50';
+            } else {
+                // 清空时恢复上传区域
+                refImageUrl = null;
+                document.getElementById('refImagePreview').style.display = 'none';
+                document.getElementById('refUploadText').style.display = 'block';
+                document.getElementById('refUploadArea').style.borderColor = 'rgba(255,255,255,0.3)';
             }
+        }
+        
+        // 图片预览加载失败处理
+        function handleRefImageError() {
+            // URL无效时，保留URL但显示提示
+            document.getElementById('refUploadArea').style.borderColor = '#FF5722';
+            document.getElementById('refImagePreview').style.display = 'none';
+            document.getElementById('refUploadText').innerHTML = '<div style="font-size:32px;margin-bottom:10px;">⚠️</div><div style="color:#FF5722;">图片URL无法预览</div><div style="font-size:12px;color:rgba(255,255,255,0.5);margin-top:5px;">但仍会尝试使用该URL生成</div>';
+            document.getElementById('refUploadText').style.display = 'block';
         }
         
         // 设置图生图快捷提示词
@@ -597,7 +707,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
         
         function updateImgCost() {
             var count = parseInt(document.getElementById('imgCount').value);
-            document.getElementById('imgCost').textContent = '¥' + (count * 0.20).toFixed(2);
+            document.getElementById('imgCost').textContent = '免费 ✨';
         }
         
         function getImgSize() {
@@ -693,10 +803,17 @@ HTML_PAGE = r'''<!DOCTYPE html>
             event.target.textContent = '...';
             
             try {
+                var requestBody = { prompt: fullPrompt, count: 1, size: size };
+                // 图生图模式添加参考图
+                var refImage = getRefImage();
+                if (currentGenMode === 'img2img' && refImage) {
+                    requestBody.ref_image = refImage;
+                }
+                
                 var resp = await fetch('/api/generate-images', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ prompt: fullPrompt, count: 1, size: size })
+                    body: JSON.stringify(requestBody)
                 });
                 var data = await resp.json();
                 if (data.images && data.images[0] && data.images[0].url) {
@@ -792,9 +909,8 @@ HTML_PAGE = r'''<!DOCTYPE html>
             var scenes = parseInt(document.getElementById('videoScenes').value);
             var duration = parseInt(document.getElementById('videoDuration').value);
             var mode = document.getElementById('videoGenMode').value;
-            var imgCost = scenes * 0.20;
-            var vidCost = mode === 'imageOnly' ? 0 : scenes * (duration === 5 ? 0.50 : 1.00);
-            document.getElementById('videoCost').textContent = '¥' + (imgCost + vidCost + 0.01).toFixed(2);
+            // 图片和视频都免费了！只有文案生成需要极少费用
+            document.getElementById('videoCost').textContent = '免费 ✨ (文案~¥0.01)';
         }
         
         async function generateVideo() {
@@ -959,7 +1075,15 @@ def index():
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "version": "v6.2"})
+    return jsonify({
+        "status": "ok", 
+        "version": "v7.0-free",
+        "api": "jimeng-free-api",
+        "models": {
+            "image": JIMENG_IMAGE_MODEL,
+            "video": JIMENG_VIDEO_MODEL
+        }
+    })
 
 @app.route('/api/generate-copy', methods=['POST'])
 def api_generate_copy():
