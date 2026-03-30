@@ -193,12 +193,14 @@ def generate_image(prompt, size="1024x1024", ref_image=None):
         print(f"[异常] {type(e).__name__}: {str(e)}", flush=True)
         return {"success": False, "error": str(e)}
 
-def generate_video_jimeng(prompt, image_url=None, duration=5):
+def generate_video_jimeng(prompt, image_url=None, duration=5, model=None, ratio="16:9"):
     """生成视频，调用即梦免费API
     Args:
         prompt: 视频描述
         image_url: 首帧图片URL（可选）
         duration: 视频时长（秒）
+        model: 视频模型（可选，有默认值）
+        ratio: 视频比例（默认16:9）
     """
     try:
         headers = {
@@ -209,30 +211,30 @@ def generate_video_jimeng(prompt, image_url=None, duration=5):
         # 视频时长限制在4-15秒
         duration = max(4, min(duration, 15))
         
-        # 根据是否有图片选择模型
+        # 根据是否有图片选择模型（如果没有指定model）
         if image_url:
             # 有图片 → Seedance 2.0（图生视频）
-            model = JIMENG_VIDEO_MODEL_IMAGE
+            use_model = model if model else JIMENG_VIDEO_MODEL_IMAGE
             payload = {
-                "model": model,
+                "model": use_model,
                 "prompt": f"@1 {prompt}",
-                "ratio": "16:9",
+                "ratio": ratio,
                 "duration": duration,
                 "file_paths": [image_url]
             }
-            print(f"[视频生成] 图生视频模式 (Seedance 2.0)", flush=True)
+            print(f"[视频生成] 图生视频模式 (模型:{use_model})", flush=True)
         else:
             # 无图片 → 3.5-pro（纯文生视频）
-            model = JIMENG_VIDEO_MODEL_TEXT
+            use_model = model if model else JIMENG_VIDEO_MODEL_TEXT
             payload = {
-                "model": model,
+                "model": use_model,
                 "prompt": prompt,
-                "ratio": "16:9",
+                "ratio": ratio,
                 "duration": duration
             }
-            print(f"[视频生成] 纯文生视频模式 (3.5-pro)", flush=True)
+            print(f"[视频生成] 纯文生视频模式 (模型:{use_model})", flush=True)
         
-        print(f"[视频生成] 模型:{model} 时长:{duration}s", flush=True)
+        print(f"[视频生成] 比例:{ratio} 时长:{duration}s", flush=True)
         print(f"[视频生成] 提示词: {prompt[:80]}...", flush=True)
         
         # 调用即梦免费API
@@ -988,6 +990,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify(requestBody)
                     });
+                    if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
                     var data = await resp.json();
                     if (data.images && data.images[0] && data.images[0].url) {
                         generatedImages.push(data.images[0].url);
@@ -1044,6 +1047,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify(requestBody)
                 });
+                if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
                 var data = await resp.json();
                 if (data.images && data.images[0] && data.images[0].url) {
                     generatedImages[index] = data.images[0].url;
@@ -1241,9 +1245,18 @@ HTML_PAGE = r'''<!DOCTYPE html>
                     body: JSON.stringify({
                         prompt: prompt,
                         duration: duration,
-                        image_url: imageUrl  // 可选首帧
+                        image_url: imageUrl,
+                        model: model,
+                        ratio: ratio
                     })
                 });
+                
+                // 先检查HTTP状态
+                if (!resp.ok) {
+                    var errText = await resp.text();
+                    throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100));
+                }
+                
                 var data = await resp.json();
                 
                 if (data.success && data.video_url) {
@@ -1308,6 +1321,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
                         method: 'POST', headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({ product_name: name, product_features: detail, scene_type: currentScene })
                     });
+                    if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
                     var data = await resp.json();
                     if (!data.success) throw new Error(data.error);
                     stepData.copy = data.content;
@@ -1319,6 +1333,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
                         method: 'POST', headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({ product_name: name, copywriting: stepData.copy, num_scenes: numScenes })
                     });
+                    if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
                     var data = await resp.json();
                     if (!data.success) throw new Error(data.error);
                     stepData.storyboard = (data.storyboard && data.storyboard.scenes) ? data.storyboard.scenes : [];
@@ -1337,6 +1352,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
                             method: 'POST', headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify({ prompt: stepData.storyboard[i].image_prompt, count: 1, size: '1920x1080' })
                         });
+                        if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
                         var data = await resp.json();
                         var imgUrl = (data.images && data.images[0]) ? data.images[0].url : null;
                         stepData.images.push(imgUrl);
@@ -1359,6 +1375,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
                             method: 'POST', headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify({ image_url: stepData.images[i], prompt: stepData.storyboard[i].video_prompt || 'smooth movement', duration: duration })
                         });
+                        if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
                         var data = await resp.json();
                         stepData.videos.push(data.success ? data.video_url : null);
                     }
@@ -1432,6 +1449,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
                     method: 'POST', headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ product_name: name, product_features: detail, scene_type: currentScene })
                 });
+                if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
                 var data = await resp.json();
                 if (!data.success) throw new Error(data.error);
                 videoData.copywriting = data.content;
@@ -1646,12 +1664,14 @@ def api_generate_video():
     img = data.get("image_url", "").strip() or None  # 图片可选
     prompt = data.get("prompt", "").strip()
     duration = data.get("duration", 5)
+    model = data.get("model", "").strip() or None  # 可选，有默认值
+    ratio = data.get("ratio", "").strip() or "16:9"  # 默认16:9
     
     if not prompt:
         return jsonify({"success": False, "error": "请提供视频描述"}), 400
     
     # 直接调用视频生成（支持有图和无图两种模式）
-    result = generate_video_jimeng(prompt, img, duration)
+    result = generate_video_jimeng(prompt, img, duration, model, ratio)
     return jsonify(result)
 
 @app.route('/api/notify', methods=['POST'])
