@@ -25,7 +25,8 @@ JIMENG_SESSION_IDS = os.environ.get("JIMENG_SESSION_IDS", "sessionid1,sessionid2
 
 # 即梦免费API模型
 JIMENG_IMAGE_MODEL = "jimeng-5.0"  # 最新图片模型
-JIMENG_VIDEO_MODEL = "jimeng-video-seedance-2.0"  # 视频模型
+JIMENG_VIDEO_MODEL_TEXT = "jimeng-video-3.5-pro"  # 纯文生视频（无需图片）
+JIMENG_VIDEO_MODEL_IMAGE = "jimeng-video-seedance-2.0"  # 图生视频（需要图片）
 
 # ========== 火山方舟配置（仅用于文案/分镜，极便宜） ==========
 ARK_API_KEY = os.environ.get("ARK_API_KEY", "5adb80da-3c5f-4ea4-99d8-e73e78899ba7")
@@ -152,9 +153,22 @@ def generate_image(prompt, size="1024x1024", ref_image=None):
         if response.status_code != 200:
             error_text = response.text[:500]
             print(f"[API错误] HTTP {response.status_code}: {error_text}", flush=True)
-            return {"success": False, "error": f"HTTP {response.status_code}: {error_text}"}
+            return {"success": False, "error": f"HTTP {response.status_code}: {error_text[:100]}"}
         
-        result = response.json()
+        # 检查响应是否为JSON
+        content_type = response.headers.get('content-type', '')
+        if 'application/json' not in content_type:
+            print(f"[API错误] 响应不是JSON: {content_type}", flush=True)
+            print(f"[API错误] 响应内容: {response.text[:300]}", flush=True)
+            return {"success": False, "error": f"API返回非JSON响应，可能服务暂时不可用"}
+        
+        try:
+            result = response.json()
+        except Exception as json_err:
+            print(f"[JSON解析失败] {str(json_err)}", flush=True)
+            print(f"[原始响应] {response.text[:300]}", flush=True)
+            return {"success": False, "error": "API响应解析失败，请稍后重试"}
+        
         print(f"[API响应] 内容: {str(result)[:200]}...", flush=True)
         
         # 解析响应（OpenAI兼容格式）
@@ -192,19 +206,34 @@ def generate_video_jimeng(prompt, image_url=None, duration=5):
             "Authorization": f"Bearer {JIMENG_SESSION_IDS}"
         }
         
-        payload = {
-            "model": JIMENG_VIDEO_MODEL,
-            "prompt": prompt,
-            "ratio": "16:9",
-            "resolution": "720p",
-            "duration": min(duration, 10)  # 即梦免费版最长10秒
-        }
+        # 视频时长限制在4-15秒
+        duration = max(4, min(duration, 15))
         
-        # 如果有首帧图片
+        # 根据是否有图片选择模型
         if image_url:
-            payload["file_paths"] = [image_url]
+            # 有图片 → Seedance 2.0（图生视频）
+            model = JIMENG_VIDEO_MODEL_IMAGE
+            payload = {
+                "model": model,
+                "prompt": f"@1 {prompt}",
+                "ratio": "16:9",
+                "duration": duration,
+                "file_paths": [image_url]
+            }
+            print(f"[视频生成] 图生视频模式 (Seedance 2.0)", flush=True)
+        else:
+            # 无图片 → 3.5-pro（纯文生视频）
+            model = JIMENG_VIDEO_MODEL_TEXT
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "ratio": "16:9",
+                "duration": duration
+            }
+            print(f"[视频生成] 纯文生视频模式 (3.5-pro)", flush=True)
         
-        print(f"[视频生成] 时长:{duration}s 提示:{prompt[:30]}...", flush=True)
+        print(f"[视频生成] 模型:{model} 时长:{duration}s", flush=True)
+        print(f"[视频生成] 提示词: {prompt[:80]}...", flush=True)
         
         # 调用即梦免费API
         api_url = f"{JIMENG_FREE_API}/v1/videos/generations"
@@ -213,14 +242,21 @@ def generate_video_jimeng(prompt, image_url=None, duration=5):
         response = requests.post(api_url, headers=headers, json=payload, timeout=600)
         
         print(f"[视频API响应] 状态码: {response.status_code}", flush=True)
+        print(f"[视频API响应] 内容(前300字): {response.text[:300]}", flush=True)
         
         if response.status_code != 200:
             error_text = response.text[:500]
             print(f"[视频API错误] HTTP {response.status_code}: {error_text}", flush=True)
-            return {"success": False, "error": f"HTTP {response.status_code}: {error_text}"}
+            return {"success": False, "error": f"HTTP {response.status_code}: {error_text[:100]}"}
         
-        result = response.json()
-        print(f"[视频API响应] 内容: {str(result)[:200]}...", flush=True)
+        # 解析JSON
+        try:
+            result = response.json()
+        except Exception as json_err:
+            print(f"[视频JSON解析失败] {str(json_err)}", flush=True)
+            return {"success": False, "error": "视频API响应解析失败"}
+        
+        print(f"[视频API响应] JSON: {str(result)[:300]}...", flush=True)
         
         # 解析响应
         if "data" in result and len(result["data"]) > 0:
@@ -1607,13 +1643,16 @@ def api_generate_images():
 @app.route('/api/generate-video', methods=['POST'])
 def api_generate_video():
     data = request.get_json() or {}
-    img = data.get("image_url", "").strip()
-    prompt = data.get("prompt", "slow movement").strip()
+    img = data.get("image_url", "").strip() or None  # 图片可选
+    prompt = data.get("prompt", "").strip()
     duration = data.get("duration", 5)
-    if not img: return jsonify({"success": False, "error": "请提供图片URL"}), 400
-    task = create_video_task(img, prompt, duration, "1080p")
-    if not task.get("success"): return jsonify(task)
-    return jsonify(wait_for_video(task["task_id"]))
+    
+    if not prompt:
+        return jsonify({"success": False, "error": "请提供视频描述"}), 400
+    
+    # 直接调用视频生成（支持有图和无图两种模式）
+    result = generate_video_jimeng(prompt, img, duration)
+    return jsonify(result)
 
 @app.route('/api/notify', methods=['POST'])
 def api_notify():
