@@ -30,7 +30,7 @@ CHAT_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 
 IMAGE_MODEL = "doubao-seedream-4-0-250828"
 VIDEO_MODEL = "doubao-seedance-1-5-pro-251215"
-CHAT_MODEL = "doubao-pro-32k-241215"
+CHAT_MODEL = "doubao-1-5-pro-32k-250115"
 
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "cli_a94e4446ee7adcce")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "xMNkE0bbPQAKBffUmImCkhIYwV6BK3iQ")
