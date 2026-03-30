@@ -159,13 +159,19 @@ def gen_image(prompt, ratio="1:1", resolution="2K", ref_images=None, strength=0.
             return {"success": False, "error": f"HTTP {resp.status_code}: {error_text[:100]}"}
         
         result = resp.json()
+        print(f"[图片API返回] {str(result)[:500]}", flush=True)  # 调试：打印完整返回
+        
         data = result.get("data") or []
         if data and len(data) > 0:
             url = data[0].get("url", "")
-            print(f"[图片成功] URL: {url[:60]}...", flush=True)
-            return {"success": True, "url": url, "image_url": url}  # 兼容两种字段名
+            if url:
+                print(f"[图片成功] URL: {url[:60]}...", flush=True)
+                return {"success": True, "url": url, "image_url": url}
+            else:
+                print(f"[图片警告] data存在但url为空", flush=True)
         
-        error_msg = result.get("message") or result.get("error", {}).get("message") or str(result)
+        error_msg = result.get("message") or result.get("error", {}).get("message") or str(result)[:200]
+        print(f"[图片失败] {error_msg}", flush=True)
         return {"success": False, "error": error_msg}
     except requests.exceptions.Timeout:
         return {"success": False, "error": "图片生成超时(180秒)"}
