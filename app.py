@@ -126,10 +126,10 @@ def generate_image(prompt, size="1024x1024", ref_image=None):
             }
             # Base64图片需要用multipart，这里简化处理，只支持URL
             if not ref_image.startswith('http'):
-                print(f"[图生图] 警告：Base64图片暂不支持，尝试文生图")
+                print(f"[图生图] 警告：Base64图片暂不支持，尝试文生图", flush=True)
                 payload.pop("images", None)
             else:
-                print(f"[图生图] ratio:{ratio} resolution:{resolution}")
+                print(f"[图生图] ratio:{ratio} resolution:{resolution}", flush=True)
         else:
             payload = {
                 "model": JIMENG_IMAGE_MODEL,
@@ -137,22 +137,46 @@ def generate_image(prompt, size="1024x1024", ref_image=None):
                 "ratio": ratio,
                 "resolution": resolution
             }
-            print(f"[文生图] ratio:{ratio} resolution:{resolution} 提示:{prompt[:30]}...")
+            print(f"[文生图] ratio:{ratio} resolution:{resolution} 提示:{prompt[:30]}...", flush=True)
         
         # 调用即梦免费API
         api_url = f"{JIMENG_FREE_API}/v1/images/generations"
-        response = requests.post(api_url, headers=headers, json=payload, timeout=120)
+        print(f"[API调用] URL: {api_url}", flush=True)
+        print(f"[API调用] 模型: {JIMENG_IMAGE_MODEL}", flush=True)
+        
+        response = requests.post(api_url, headers=headers, json=payload, timeout=180)
+        
+        print(f"[API响应] 状态码: {response.status_code}", flush=True)
+        
+        # 检查HTTP状态码
+        if response.status_code != 200:
+            error_text = response.text[:500]
+            print(f"[API错误] HTTP {response.status_code}: {error_text}", flush=True)
+            return {"success": False, "error": f"HTTP {response.status_code}: {error_text}"}
+        
         result = response.json()
+        print(f"[API响应] 内容: {str(result)[:200]}...", flush=True)
         
         # 解析响应（OpenAI兼容格式）
         if "data" in result and len(result["data"]) > 0:
             image_url = result["data"][0].get("url", "")
+            print(f"[成功] 图片URL: {image_url[:80]}...", flush=True)
             return {"success": True, "image_url": image_url}
         elif "error" in result:
-            return {"success": False, "error": result["error"].get("message", str(result))}
+            error_msg = result["error"].get("message", str(result))
+            print(f"[API错误] {error_msg}", flush=True)
+            return {"success": False, "error": error_msg}
         else:
+            print(f"[未知响应] {str(result)}", flush=True)
             return {"success": False, "error": str(result)}
+    except requests.exceptions.Timeout:
+        print(f"[超时] API请求超时(180秒)", flush=True)
+        return {"success": False, "error": "API请求超时，请稍后重试"}
+    except requests.exceptions.ConnectionError as e:
+        print(f"[连接错误] {str(e)}", flush=True)
+        return {"success": False, "error": f"连接失败: {str(e)}"}
     except Exception as e:
+        print(f"[异常] {type(e).__name__}: {str(e)}", flush=True)
         return {"success": False, "error": str(e)}
 
 def generate_video_jimeng(prompt, image_url=None, duration=5):
@@ -180,22 +204,41 @@ def generate_video_jimeng(prompt, image_url=None, duration=5):
         if image_url:
             payload["file_paths"] = [image_url]
         
-        print(f"[视频生成] 时长:{duration}s 提示:{prompt[:30]}...")
+        print(f"[视频生成] 时长:{duration}s 提示:{prompt[:30]}...", flush=True)
         
         # 调用即梦免费API
         api_url = f"{JIMENG_FREE_API}/v1/videos/generations"
-        response = requests.post(api_url, headers=headers, json=payload, timeout=300)
+        print(f"[视频API] URL: {api_url}", flush=True)
+        
+        response = requests.post(api_url, headers=headers, json=payload, timeout=600)
+        
+        print(f"[视频API响应] 状态码: {response.status_code}", flush=True)
+        
+        if response.status_code != 200:
+            error_text = response.text[:500]
+            print(f"[视频API错误] HTTP {response.status_code}: {error_text}", flush=True)
+            return {"success": False, "error": f"HTTP {response.status_code}: {error_text}"}
+        
         result = response.json()
+        print(f"[视频API响应] 内容: {str(result)[:200]}...", flush=True)
         
         # 解析响应
         if "data" in result and len(result["data"]) > 0:
             video_url = result["data"][0].get("url", "")
+            print(f"[视频成功] URL: {video_url[:80]}...", flush=True)
             return {"success": True, "video_url": video_url}
         elif "error" in result:
-            return {"success": False, "error": result["error"].get("message", str(result))}
+            error_msg = result["error"].get("message", str(result))
+            print(f"[视频API错误] {error_msg}", flush=True)
+            return {"success": False, "error": error_msg}
         else:
+            print(f"[视频未知响应] {str(result)}", flush=True)
             return {"success": False, "error": str(result)}
+    except requests.exceptions.Timeout:
+        print(f"[视频超时] API请求超时(600秒)", flush=True)
+        return {"success": False, "error": "视频生成超时，请稍后重试"}
     except Exception as e:
+        print(f"[视频异常] {type(e).__name__}: {str(e)}", flush=True)
         return {"success": False, "error": str(e)}
 
 # 保留旧函数名兼容性（即梦免费API是同步返回的）
