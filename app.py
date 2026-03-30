@@ -1,7 +1,7 @@
 """
-即梦AI Flask代理服务 v6.1
+即梦AI Flask代理服务 v6.2
 ===========================
-新增：快速图片生成模式（独立Tab，支持高分辨率）
+新增：图生图功能（支持参考图上传）
 """
 
 from flask import Flask, request, jsonify, Response
@@ -70,11 +70,24 @@ def chat_completion(system_prompt, user_prompt):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def generate_image(prompt, size="1024x1024"):
+def generate_image(prompt, size="1024x1024", ref_image=None):
+    """生成图片，支持文生图和图生图
+    Args:
+        prompt: 提示词
+        size: 图片尺寸
+        ref_image: 参考图URL（可选，提供则为图生图模式）
+    """
     try:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {ARK_API_KEY}"}
         payload = {"model": IMAGE_MODEL, "prompt": prompt, "size": size, "response_format": "url", "watermark": False}
-        print(f"[图片] 尺寸:{size} 提示:{prompt[:50]}...")
+        
+        # 图生图模式：添加参考图
+        if ref_image:
+            payload["image"] = ref_image
+            print(f"[图生图] 尺寸:{size} 参考图:{ref_image[:50]}... 提示:{prompt[:30]}...")
+        else:
+            print(f"[文生图] 尺寸:{size} 提示:{prompt[:50]}...")
+        
         response = requests.post(IMAGE_API_ENDPOINT, headers=headers, json=payload, timeout=120)
         result = response.json()
         if "data" in result and len(result["data"]) > 0:
@@ -117,7 +130,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI创作工具 v6.1</title>
+    <title>AI创作工具 v6.2</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); min-height: 100vh; color: #fff; }
@@ -192,7 +205,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🎨 AI创作工具 <span class="version">v6.1</span></h1>
+            <h1>🎨 AI创作工具 <span class="version">v6.2</span></h1>
             <button class="btn btn-secondary btn-small" onclick="showHistory()">📋 历史</button>
         </div>
         
@@ -213,14 +226,50 @@ HTML_PAGE = r'''<!DOCTYPE html>
             <div class="card">
                 <div class="card-title">🖼️ 快速生成图片</div>
                 
+                <!-- 生成模式切换 -->
+                <div class="section-title">✨ 生成模式</div>
+                <div class="option-grid" style="grid-template-columns: 1fr 1fr;">
+                    <div class="option-item selected" data-mode="text2img" onclick="selectGenMode('text2img')"><div class="icon">📝</div>文生图</div>
+                    <div class="option-item" data-mode="img2img" onclick="selectGenMode('img2img')"><div class="icon">🖼️</div>图生图</div>
+                </div>
+                
+                <!-- 参考图上传（图生图模式） -->
+                <div id="refImageSection" class="hidden">
+                    <div class="section-title">📤 上传参考图 *</div>
+                    <div style="border:2px dashed rgba(255,255,255,0.3);border-radius:12px;padding:20px;text-align:center;cursor:pointer;transition:all 0.3s;margin-bottom:15px;" id="refUploadArea" onclick="document.getElementById('refImageFile').click()">
+                        <input type="file" id="refImageFile" accept="image/*" style="display:none" onchange="handleRefImageUpload(event)">
+                        <div id="refUploadText">
+                            <div style="font-size:32px;margin-bottom:10px;">📁</div>
+                            <div>点击上传参考图片</div>
+                            <div style="font-size:12px;color:rgba(255,255,255,0.5);margin-top:5px;">支持 JPG、PNG 格式</div>
+                        </div>
+                        <img id="refImagePreview" style="max-width:200px;max-height:150px;border-radius:8px;display:none;">
+                    </div>
+                    <div class="form-group" style="margin-bottom:10px;">
+                        <label>或输入图片URL</label>
+                        <input type="text" id="refImageUrl" placeholder="https://example.com/image.jpg" oninput="updateRefImageFromUrl()">
+                    </div>
+                </div>
+                
                 <div class="form-group">
-                    <label>图片描述 * <button class="btn btn-secondary btn-small" onclick="showPromptTemplates()" style="margin-left:10px;">📋 模板</button></label>
+                    <label id="promptLabel">图片描述 * <button class="btn btn-secondary btn-small" onclick="showPromptTemplates()" style="margin-left:10px;">📋 模板</button></label>
                     <textarea id="imgPrompt" placeholder="详细描述你想要的图片内容...&#10;例如：一台银色的笔记本电脑，放在简约的白色桌面上，旁边有一杯咖啡和一盆绿植，阳光从窗户照进来，画面温馨自然"></textarea>
                 </div>
                 
                 <div class="form-group">
                     <label>负面提示词（排除不想要的元素）</label>
                     <input type="text" id="negativePrompt" placeholder="例如：模糊, 低质量, 变形, 水印, 文字">
+                </div>
+                
+                <!-- 图生图专用模板 -->
+                <div id="img2imgTemplates" class="hidden" style="margin-bottom:15px;">
+                    <div class="section-title">🎯 图生图快捷操作</div>
+                    <div class="option-grid" style="grid-template-columns: repeat(4, 1fr);">
+                        <div class="option-item" onclick="setImg2ImgPrompt('change_bg')"><div class="icon">🏞️</div>换背景</div>
+                        <div class="option-item" onclick="setImg2ImgPrompt('to_cartoon')"><div class="icon">🎨</div>转卡通</div>
+                        <div class="option-item" onclick="setImg2ImgPrompt('to_3d')"><div class="icon">🎮</div>转3D</div>
+                        <div class="option-item" onclick="setImg2ImgPrompt('enhance')"><div class="icon">✨</div>高清增强</div>
+                    </div>
                 </div>
                 
                 <!-- 提示词模板弹窗 -->
@@ -432,8 +481,85 @@ HTML_PAGE = r'''<!DOCTYPE html>
         
         var currentImgStyle = "realistic";
         var currentScene = "product";
+        var currentGenMode = "text2img";  // 新增：生成模式 text2img / img2img
+        var refImageBase64 = null;  // 新增：参考图Base64
+        var refImageUrl = null;     // 新增：参考图URL
         var generatedImages = [];
         var videoData = { copywriting: "", scenes: [] };
+        
+        // 图生图提示词模板
+        var IMG2IMG_PROMPTS = {
+            change_bg: "将图片背景更换为简约现代的室内场景，保持主体不变，柔和自然光",
+            to_cartoon: "将图片转换为可爱的卡通插画风格，保持主体特征，色彩鲜艳活泼",
+            to_3d: "将图片转换为3D渲染风格，保持主体形态，添加立体感和光影效果",
+            enhance: "高清增强，提升画面清晰度和细节，保持原有风格和构图，8K超高清"
+        };
+        
+        // 生成模式切换
+        function selectGenMode(mode) {
+            currentGenMode = mode;
+            document.querySelectorAll('[data-mode]').forEach(t => t.classList.remove('selected'));
+            document.querySelector('[data-mode="'+mode+'"]').classList.add('selected');
+            
+            // 显示/隐藏参考图上传区域
+            document.getElementById('refImageSection').classList.toggle('hidden', mode !== 'img2img');
+            document.getElementById('img2imgTemplates').classList.toggle('hidden', mode !== 'img2img');
+            
+            // 更新提示词标签
+            if (mode === 'img2img') {
+                document.getElementById('promptLabel').innerHTML = '修改描述 * <button class="btn btn-secondary btn-small" onclick="showPromptTemplates()" style="margin-left:10px;">📋 模板</button>';
+                document.getElementById('imgPrompt').placeholder = '描述你想要的修改效果...\\n例如：将背景换成海边沙滩，保持产品不变';
+            } else {
+                document.getElementById('promptLabel').innerHTML = '图片描述 * <button class="btn btn-secondary btn-small" onclick="showPromptTemplates()" style="margin-left:10px;">📋 模板</button>';
+                document.getElementById('imgPrompt').placeholder = '详细描述你想要的图片内容...\\n例如：一台银色的笔记本电脑，放在简约的白色桌面上';
+            }
+        }
+        
+        // 处理参考图上传
+        function handleRefImageUpload(event) {
+            var file = event.target.files[0];
+            if (!file) return;
+            
+            var reader = new FileReader();
+            reader.onload = function(e) {
+                refImageBase64 = e.target.result;
+                refImageUrl = null;  // 清除URL
+                document.getElementById('refImageUrl').value = '';
+                
+                // 显示预览
+                document.getElementById('refImagePreview').src = refImageBase64;
+                document.getElementById('refImagePreview').style.display = 'block';
+                document.getElementById('refUploadText').style.display = 'none';
+                document.getElementById('refUploadArea').style.borderColor = '#4CAF50';
+                document.getElementById('refUploadArea').style.borderStyle = 'solid';
+            };
+            reader.readAsDataURL(file);
+        }
+        
+        // 从URL更新参考图
+        function updateRefImageFromUrl() {
+            var url = document.getElementById('refImageUrl').value.trim();
+            if (url) {
+                refImageUrl = url;
+                refImageBase64 = null;
+                // 尝试显示预览
+                document.getElementById('refImagePreview').src = url;
+                document.getElementById('refImagePreview').style.display = 'block';
+                document.getElementById('refUploadText').style.display = 'none';
+                document.getElementById('refUploadArea').style.borderColor = '#4CAF50';
+            }
+        }
+        
+        // 设置图生图快捷提示词
+        function setImg2ImgPrompt(type) {
+            document.getElementById('imgPrompt').value = IMG2IMG_PROMPTS[type] || '';
+        }
+        
+        // 获取参考图（优先URL，其次Base64）
+        function getRefImage() {
+            if (currentGenMode !== 'img2img') return null;
+            return refImageUrl || refImageBase64 || null;
+        }
         
         // 模式切换
         function switchMode(mode) {
@@ -483,6 +609,13 @@ HTML_PAGE = r'''<!DOCTYPE html>
             var prompt = document.getElementById('imgPrompt').value.trim();
             if (!prompt) { alert('请输入图片描述'); return; }
             
+            // 图生图模式检查参考图
+            var refImage = getRefImage();
+            if (currentGenMode === 'img2img' && !refImage) {
+                alert('请上传参考图或输入图片URL');
+                return;
+            }
+            
             var negPrompt = document.getElementById('negativePrompt').value.trim();
             var size = getImgSize();
             var count = parseInt(document.getElementById('imgCount').value);
@@ -497,16 +630,24 @@ HTML_PAGE = r'''<!DOCTYPE html>
             document.getElementById('imgResults').classList.add('hidden');
             document.getElementById('genImgBtn').disabled = true;
             
+            var modeText = currentGenMode === 'img2img' ? '图生图' : '文生图';
+            
             generatedImages = [];
             for (var i = 0; i < count; i++) {
-                document.getElementById('imgProgressText').textContent = '生成第 ' + (i+1) + '/' + count + ' 张...';
+                document.getElementById('imgProgressText').textContent = modeText + ' 第 ' + (i+1) + '/' + count + ' 张...';
                 document.getElementById('imgProgressBar').style.width = ((i+1)/count*100) + '%';
                 
                 try {
+                    var requestBody = { prompt: fullPrompt, count: 1, size: size };
+                    // 图生图模式添加参考图
+                    if (currentGenMode === 'img2img' && refImage) {
+                        requestBody.ref_image = refImage;
+                    }
+                    
                     var resp = await fetch('/api/generate-images', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ prompt: fullPrompt, count: 1, size: size })
+                        body: JSON.stringify(requestBody)
                     });
                     var data = await resp.json();
                     if (data.images && data.images[0] && data.images[0].url) {
@@ -622,7 +763,18 @@ HTML_PAGE = r'''<!DOCTYPE html>
             document.getElementById('imgProgress').classList.add('hidden');
             document.getElementById('imgResults').classList.add('hidden');
             document.getElementById('imgPrompt').value = '';
+            document.getElementById('negativePrompt').value = '';
             generatedImages = [];
+            
+            // 清除参考图
+            refImageBase64 = null;
+            refImageUrl = null;
+            document.getElementById('refImageUrl').value = '';
+            document.getElementById('refImagePreview').style.display = 'none';
+            document.getElementById('refUploadText').style.display = 'block';
+            document.getElementById('refUploadArea').style.borderColor = 'rgba(255,255,255,0.3)';
+            document.getElementById('refUploadArea').style.borderStyle = 'dashed';
+            document.getElementById('refImageFile').value = '';
         }
         
         // ========== 视频生成模式 ==========
@@ -807,7 +959,7 @@ def index():
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "version": "v6.1"})
+    return jsonify({"status": "ok", "version": "v6.2"})
 
 @app.route('/api/generate-copy', methods=['POST'])
 def api_generate_copy():
@@ -844,11 +996,18 @@ def api_generate_images():
     prompt = data.get("prompt", "").strip()
     count = min(data.get("count", 1), 4)
     size = data.get("size", "1920x1080")
+    ref_image = data.get("ref_image")  # 新增：参考图（URL或Base64）
+    
     if not prompt: return jsonify({"success": False, "error": "请输入提示词"}), 400
+    
     images = []
     for i in range(count):
-        r = generate_image(prompt, size)
-        images.append({"index": i+1, "url": r.get("image_url") if r.get("success") else None, "error": r.get("error") if not r.get("success") else None})
+        r = generate_image(prompt, size, ref_image)
+        images.append({
+            "index": i+1, 
+            "url": r.get("image_url") if r.get("success") else None, 
+            "error": r.get("error") if not r.get("success") else None
+        })
     return jsonify({"success": True, "images": images})
 
 @app.route('/api/generate-video', methods=['POST'])
