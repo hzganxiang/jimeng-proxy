@@ -1612,8 +1612,8 @@ def health():
 @app.route('/api/generate-copy', methods=['POST'])
 def api_generate_copy():
     data = request.get_json() or {}
-    name = data.get("product_name", "").strip()
-    features = data.get("product_features", "").strip()
+    name = (data.get("product_name") or "").strip()
+    features = (data.get("product_features") or "").strip()
     if not name: return jsonify({"success": False, "error": "请输入主题"}), 400
     system = "短视频文案专家。生成30秒文案，80-150字，分4段。"
     user = f"主题：{name}\n详情：{features}"
@@ -1622,8 +1622,8 @@ def api_generate_copy():
 @app.route('/api/generate-storyboard', methods=['POST'])
 def api_generate_storyboard():
     data = request.get_json() or {}
-    name = data.get("product_name", "").strip()
-    copy = data.get("copywriting", "").strip()
+    name = (data.get("product_name") or "").strip()
+    copy = (data.get("copywriting") or "").strip()
     num = data.get("num_scenes", 4)
     if not name or not copy: return jsonify({"success": False, "error": "缺少参数"}), 400
     system = f'分镜师。生成{num}个分镜。只输出JSON：{{"scenes":[{{"scene_id":1,"description":"描述","image_prompt":"English prompt, 8K UHD","video_prompt":"camera movement"}}]}}'
@@ -1641,7 +1641,7 @@ def api_generate_storyboard():
 @app.route('/api/generate-images', methods=['POST'])
 def api_generate_images():
     data = request.get_json() or {}
-    prompt = data.get("prompt", "").strip()
+    prompt = (data.get("prompt") or "").strip()
     count = min(data.get("count", 1), 4)
     size = data.get("size", "1920x1080")
     ref_image = data.get("ref_image")  # 新增：参考图（URL或Base64）
@@ -1661,11 +1661,11 @@ def api_generate_images():
 @app.route('/api/generate-video', methods=['POST'])
 def api_generate_video():
     data = request.get_json() or {}
-    img = data.get("image_url", "").strip() or None  # 图片可选
-    prompt = data.get("prompt", "").strip()
+    img = (data.get("image_url") or "").strip() or None  # 图片可选
+    prompt = (data.get("prompt") or "").strip()
     duration = data.get("duration", 5)
-    model = data.get("model", "").strip() or None  # 可选，有默认值
-    ratio = data.get("ratio", "").strip() or "16:9"  # 默认16:9
+    model = (data.get("model") or "").strip() or None  # 可选，有默认值
+    ratio = (data.get("ratio") or "").strip() or "16:9"  # 默认16:9
     
     if not prompt:
         return jsonify({"success": False, "error": "请提供视频描述"}), 400
