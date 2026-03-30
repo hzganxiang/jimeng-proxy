@@ -126,13 +126,17 @@ def vision(system, user, image_url=None, image_base64=None):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def gen_image(prompt, ratio="1:1", resolution="2K", ref_images=None, strength=0.5, model=None):
+def gen_image(prompt, ratio="1:1", resolution="2k", ref_images=None, strength=0.5, model=None):
     """生成图片 - ref_images必须是URL列表"""
     try:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {JIMENG_SESSION_IDS}"
         }
+        
+        # 分辨率统一转小写
+        resolution = resolution.lower() if resolution else "2k"
+        
         payload = {
             "model": model or JIMENG_IMAGE_MODEL,
             "prompt": prompt,
@@ -300,7 +304,7 @@ def api_batch_images():
     prompt = (d.get("prompt") or "").strip()
     count = min(int(d.get("count", 4)), 40)
     ratio = d.get("ratio", "1:1")
-    resolution = d.get("resolution", "2K")
+    resolution = d.get("resolution", "2k")
     variations = d.get("variations", False)
     
     if not prompt:
@@ -560,7 +564,7 @@ def api_generate_images():
     prompt = (d.get("prompt") or "").strip()
     count = min(int(d.get("count", 1)), 4)
     ratio = d.get("ratio", "1:1")
-    resolution = d.get("resolution", "2K")
+    resolution = d.get("resolution", "2k")
     ref = d.get("ref_image")
     
     if not prompt:
@@ -745,7 +749,7 @@ body{font-family:-apple-system,sans-serif;background:var(--bg);min-height:100vh;
 <select id="imageRatio"><option value="1:1">1:1</option><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option></select>
 </div>
 <div class="form-group"><label>画质</label>
-<select id="imageRes"><option value="1K">1K</option><option value="2K" selected>2K</option></select>
+<select id="imageRes"><option value="1k">1k</option><option value="2k" selected>2k</option><option value="4k">4k</option></select>
 </div>
 <div class="form-group"><label>数量</label>
 <select id="imageCount"><option value="1">1张</option><option value="4" selected>4张</option></select>
