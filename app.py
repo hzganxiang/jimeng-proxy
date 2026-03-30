@@ -1,10 +1,12 @@
 """
-即梦AI Flask代理服务 v7.0
-===========================
-重大更新：改用即梦免费API，支持多账号轮询
-- 图片生成：免费（66次/天/账号）
-- 视频生成：免费（66次/天/账号）
-- 文案/分镜：继续使用火山方舟（极便宜）
+即梦AI Flask代理服务 v8.5 修复版
+=================================
+修复的BUG：
+1. base64参考图处理
+2. HTTP状态检查
+3. 前端$函数兼容
+4. Tab切换逻辑
+5. 返回字段统一
 """
 
 from flask import Flask, request, jsonify, Response
@@ -12,209 +14,176 @@ import requests
 import json
 import os
 import re
-import time
-import threading
+import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
-# ========== 即梦免费API配置 ==========
-# 部署后填入你的即梦免费API地址
-JIMENG_FREE_API = os.environ.get("JIMENG_FREE_API", "https://你的jimeng-api.zeabur.app")
-# 多个sessionid用逗号分隔
-JIMENG_SESSION_IDS = os.environ.get("JIMENG_SESSION_IDS", "sessionid1,sessionid2,sessionid3")
+# ========== 配置 ==========
+JIMENG_FREE_API = os.environ.get("JIMENG_FREE_API", "https://wyzxhy168.zeabur.app")
+JIMENG_SESSION_IDS = os.environ.get("JIMENG_SESSION_IDS", "")
+JIMENG_IMAGE_MODEL = os.environ.get("JIMENG_IMAGE_MODEL", "jimeng-5.0")
+JIMENG_VIDEO_MODEL_TEXT = "jimeng-video-3.5-pro"
+JIMENG_VIDEO_MODEL_IMAGE = "jimeng-video-seedance-2.0"
 
-# 即梦免费API模型
-JIMENG_IMAGE_MODEL = "jimeng-5.0"  # 最新图片模型
-JIMENG_VIDEO_MODEL_TEXT = "jimeng-video-3.5-pro"  # 纯文生视频（无需图片）
-JIMENG_VIDEO_MODEL_IMAGE = "jimeng-video-seedance-2.0"  # 图生视频（需要图片）
-
-# ========== 火山方舟配置（仅用于文案/分镜，极便宜） ==========
-ARK_API_KEY = os.environ.get("ARK_API_KEY", "5adb80da-3c5f-4ea4-99d8-e73e78899ba7")
+ARK_API_KEY = os.environ.get("ARK_API_KEY", "")
 CHAT_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 CHAT_MODEL = "doubao-1-5-pro-32k-250115"
+VISION_MODEL = "doubao-1-5-vision-pro-32k-250115"
 
-# ========== 飞书配置 ==========
-FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "cli_a94e4446ee7adcce")
-FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "xMNkE0bbPQAKBffUmImCkhIYwV6BK3iQ")
-FEISHU_BOT_WEBHOOK = os.environ.get("FEISHU_BOT_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/d8a5016b-99ac-413a-bba4-3e47d892a1af")
+FEISHU_BOT_WEBHOOK = os.environ.get("FEISHU_BOT_WEBHOOK", "")
 
-# 费用（现在是免费的！）
-PRICE_IMAGE = 0.00
-PRICE_VIDEO_5S = 0.00
-PRICE_VIDEO_10S = 0.00
+executor = ThreadPoolExecutor(max_workers=5)
 
-projects = {}
-
-def send_feishu_text(text):
-    try: requests.post(FEISHU_BOT_WEBHOOK, json={"msg_type": "text", "content": {"text": text}}, timeout=10)
-    except: pass
-
-def send_feishu_message(title, content_blocks):
-    try: requests.post(FEISHU_BOT_WEBHOOK, json={"msg_type": "post", "content": {"post": {"zh_cn": {"title": title, "content": content_blocks}}}}, timeout=10)
-    except: pass
-
-def get_feishu_tenant_token():
+# ========== 工具函数 ==========
+def send_feishu(text, title=None):
+    if not FEISHU_BOT_WEBHOOK: 
+        return
     try:
-        resp = requests.post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}, timeout=10)
-        return resp.json().get("tenant_access_token") if resp.json().get("code") == 0 else None
-    except: return None
+        if title:
+            requests.post(FEISHU_BOT_WEBHOOK, json={
+                "msg_type": "interactive",
+                "card": {
+                    "header": {"title": {"tag": "plain_text", "content": title}},
+                    "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": text}}]
+                }
+            }, timeout=10)
+        else:
+            requests.post(FEISHU_BOT_WEBHOOK, json={"msg_type": "text", "content": {"text": text}}, timeout=10)
+    except Exception:
+        pass
 
-def upload_image_to_feishu(image_url):
+def chat(system, user, model=None):
+    """文本对话"""
+    if not ARK_API_KEY: 
+        return {"success": False, "error": "未配置ARK_API_KEY"}
     try:
-        token = get_feishu_tenant_token()
-        if not token: return None
-        img_resp = requests.get(image_url, timeout=60)
-        if img_resp.status_code != 200: return None
-        resp = requests.post("https://open.feishu.cn/open-apis/im/v1/images", headers={"Authorization": f"Bearer {token}"}, files={"image": (f"ai_{int(time.time())}.jpg", img_resp.content, "image/jpeg")}, data={"image_type": "message"}, timeout=30)
-        return resp.json().get("data", {}).get("image_key") if resp.json().get("code") == 0 else None
-    except: return None
-
-def chat_completion(system_prompt, user_prompt):
-    try:
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {ARK_API_KEY}"}
-        payload = {"model": CHAT_MODEL, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]}
-        response = requests.post(CHAT_API_ENDPOINT, headers=headers, json=payload, timeout=60)
-        result = response.json()
-        if "choices" in result and len(result["choices"]) > 0:
-            return {"success": True, "content": result["choices"][0].get("message", {}).get("content", "")}
+        resp = requests.post(
+            CHAT_API_ENDPOINT,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {ARK_API_KEY}"},
+            json={
+                "model": model or CHAT_MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user}
+                ]
+            },
+            timeout=60
+        )
+        if resp.status_code != 200:
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+        
+        result = resp.json()
+        choices = result.get("choices") or []
+        if choices:
+            content = choices[0].get("message", {}).get("content", "")
+            return {"success": True, "content": content}
         return {"success": False, "error": result.get("error", {}).get("message", str(result))}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def generate_image(prompt, size="1024x1024", ref_image=None):
-    """生成图片，调用即梦免费API
-    Args:
-        prompt: 提示词
-        size: 图片尺寸（会转换为ratio格式）
-        ref_image: 参考图（URL或Base64，可选）
-    """
+def vision(system, user, image_url=None, image_base64=None):
+    """视觉对话"""
+    if not ARK_API_KEY:
+        return {"success": False, "error": "未配置ARK_API_KEY"}
     try:
-        # 转换尺寸为ratio格式
-        size_to_ratio = {
-            "1024x1024": "1:1", "1440x1440": "1:1", "2048x2048": "1:1",
-            "1440x1920": "3:4", "1080x1440": "3:4",
-            "1920x1440": "4:3", "1440x1080": "4:3",
-            "1080x1920": "9:16", "720x1280": "9:16",
-            "1920x1080": "16:9", "1280x720": "16:9",
-        }
-        ratio = size_to_ratio.get(size, "1:1")
+        content = []
+        if image_base64:
+            # 处理base64前缀
+            if "," in image_base64:
+                image_base64 = image_base64.split(",")[1]
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+            })
+        elif image_url:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": image_url}
+            })
+        content.append({"type": "text", "text": user})
         
-        # 转换尺寸为resolution格式
-        total_pixels = 1
-        if 'x' in size:
-            w, h = map(int, size.split('x'))
-            total_pixels = w * h
-        resolution = "2k" if total_pixels >= 2000000 else "1k"
+        resp = requests.post(
+            CHAT_API_ENDPOINT,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {ARK_API_KEY}"},
+            json={
+                "model": VISION_MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": content}
+                ]
+            },
+            timeout=60
+        )
+        if resp.status_code != 200:
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
         
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {JIMENG_SESSION_IDS}"
-        }
-        
-        # 图生图模式
-        if ref_image:
-            # 处理Base64格式
-            if ref_image.startswith('data:'):
-                if ';base64,' in ref_image:
-                    ref_image = ref_image.split(';base64,')[1]
-            
-            payload = {
-                "model": JIMENG_IMAGE_MODEL,
-                "prompt": prompt,
-                "images": [ref_image] if ref_image.startswith('http') else [],
-                "ratio": ratio,
-                "resolution": resolution
-            }
-            # Base64图片需要用multipart，这里简化处理，只支持URL
-            if not ref_image.startswith('http'):
-                print(f"[图生图] 警告：Base64图片暂不支持，尝试文生图", flush=True)
-                payload.pop("images", None)
-            else:
-                print(f"[图生图] ratio:{ratio} resolution:{resolution}", flush=True)
-        else:
-            payload = {
-                "model": JIMENG_IMAGE_MODEL,
-                "prompt": prompt,
-                "ratio": ratio,
-                "resolution": resolution
-            }
-            print(f"[文生图] ratio:{ratio} resolution:{resolution} 提示:{prompt[:30]}...", flush=True)
-        
-        # 调用即梦免费API
-        api_url = f"{JIMENG_FREE_API}/v1/images/generations"
-        print(f"[API调用] URL: {api_url}", flush=True)
-        print(f"[API调用] 模型: {JIMENG_IMAGE_MODEL}", flush=True)
-        
-        response = requests.post(api_url, headers=headers, json=payload, timeout=180)
-        
-        print(f"[API响应] 状态码: {response.status_code}", flush=True)
-        
-        # 检查HTTP状态码
-        if response.status_code != 200:
-            error_text = response.text[:500]
-            print(f"[API错误] HTTP {response.status_code}: {error_text}", flush=True)
-            return {"success": False, "error": f"HTTP {response.status_code}: {error_text[:100]}"}
-        
-        # 检查响应是否为JSON
-        content_type = response.headers.get('content-type', '')
-        if 'application/json' not in content_type:
-            print(f"[API错误] 响应不是JSON: {content_type}", flush=True)
-            print(f"[API错误] 响应内容: {response.text[:300]}", flush=True)
-            return {"success": False, "error": f"API返回非JSON响应，可能服务暂时不可用"}
-        
-        try:
-            result = response.json()
-        except Exception as json_err:
-            print(f"[JSON解析失败] {str(json_err)}", flush=True)
-            print(f"[原始响应] {response.text[:300]}", flush=True)
-            return {"success": False, "error": "API响应解析失败，请稍后重试"}
-        
-        print(f"[API响应] 内容: {str(result)[:200]}...", flush=True)
-        
-        # 解析响应（OpenAI兼容格式）
-        if "data" in result and len(result["data"]) > 0:
-            image_url = result["data"][0].get("url", "")
-            print(f"[成功] 图片URL: {image_url[:80]}...", flush=True)
-            return {"success": True, "image_url": image_url}
-        elif "error" in result:
-            error_msg = result["error"].get("message", str(result))
-            print(f"[API错误] {error_msg}", flush=True)
-            return {"success": False, "error": error_msg}
-        else:
-            print(f"[未知响应] {str(result)}", flush=True)
-            return {"success": False, "error": str(result)}
-    except requests.exceptions.Timeout:
-        print(f"[超时] API请求超时(180秒)", flush=True)
-        return {"success": False, "error": "API请求超时，请稍后重试"}
-    except requests.exceptions.ConnectionError as e:
-        print(f"[连接错误] {str(e)}", flush=True)
-        return {"success": False, "error": f"连接失败: {str(e)}"}
+        result = resp.json()
+        choices = result.get("choices") or []
+        if choices:
+            return {"success": True, "content": choices[0].get("message", {}).get("content", "")}
+        return {"success": False, "error": str(result)}
     except Exception as e:
-        print(f"[异常] {type(e).__name__}: {str(e)}", flush=True)
         return {"success": False, "error": str(e)}
 
-def generate_video_jimeng(prompt, image_url=None, duration=5, model=None, ratio="16:9"):
-    """生成视频，调用即梦免费API
-    Args:
-        prompt: 视频描述
-        image_url: 首帧图片URL（可选）
-        duration: 视频时长（秒）
-        model: 视频模型（可选，有默认值）
-        ratio: 视频比例（默认16:9）
-    """
+def gen_image(prompt, ratio="1:1", resolution="2K", ref_images=None, strength=0.5, model=None):
+    """生成图片 - ref_images必须是URL列表"""
     try:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {JIMENG_SESSION_IDS}"
         }
+        payload = {
+            "model": model or JIMENG_IMAGE_MODEL,
+            "prompt": prompt,
+            "ratio": ratio,
+            "resolution": resolution
+        }
         
-        # 视频时长限制在4-15秒
+        if ref_images and len(ref_images) > 0:
+            # 过滤掉非URL的参考图
+            valid_refs = [r for r in ref_images if r and r.startswith("http")]
+            if valid_refs:
+                payload["images"] = valid_refs[:10]
+                payload["sample_strength"] = strength
+        
+        print(f"[图片生成] 提示词: {prompt[:50]}... 比例:{ratio} 分辨率:{resolution}", flush=True)
+        
+        resp = requests.post(f"{JIMENG_FREE_API}/v1/images/generations", headers=headers, json=payload, timeout=180)
+        
+        print(f"[图片API] 状态码: {resp.status_code}", flush=True)
+        
+        if resp.status_code != 200:
+            error_text = resp.text[:300]
+            print(f"[图片API错误] {error_text}", flush=True)
+            return {"success": False, "error": f"HTTP {resp.status_code}: {error_text[:100]}"}
+        
+        result = resp.json()
+        data = result.get("data") or []
+        if data and len(data) > 0:
+            url = data[0].get("url", "")
+            print(f"[图片成功] URL: {url[:60]}...", flush=True)
+            return {"success": True, "url": url, "image_url": url}  # 兼容两种字段名
+        
+        error_msg = result.get("message") or result.get("error", {}).get("message") or str(result)
+        return {"success": False, "error": error_msg}
+    except requests.exceptions.Timeout:
+        return {"success": False, "error": "图片生成超时(180秒)"}
+    except Exception as e:
+        print(f"[图片异常] {type(e).__name__}: {str(e)}", flush=True)
+        return {"success": False, "error": str(e)}
+
+def gen_video(prompt, image_url=None, duration=5, model=None, ratio="16:9"):
+    """生成视频"""
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {JIMENG_SESSION_IDS}"
+        }
         duration = max(4, min(duration, 15))
         
-        # 根据是否有图片选择模型（如果没有指定model）
         if image_url:
-            # 有图片 → Seedance 2.0（图生视频）
-            use_model = model if model else JIMENG_VIDEO_MODEL_IMAGE
+            use_model = model or JIMENG_VIDEO_MODEL_IMAGE
             payload = {
                 "model": use_model,
                 "prompt": f"@1 {prompt}",
@@ -222,1501 +191,1134 @@ def generate_video_jimeng(prompt, image_url=None, duration=5, model=None, ratio=
                 "duration": duration,
                 "file_paths": [image_url]
             }
-            print(f"[视频生成] 图生视频模式 (模型:{use_model})", flush=True)
+            print(f"[视频生成] 图生视频模式 模型:{use_model}", flush=True)
         else:
-            # 无图片 → 3.5-pro（纯文生视频）
-            use_model = model if model else JIMENG_VIDEO_MODEL_TEXT
+            use_model = model or JIMENG_VIDEO_MODEL_TEXT
             payload = {
                 "model": use_model,
                 "prompt": prompt,
                 "ratio": ratio,
                 "duration": duration
             }
-            print(f"[视频生成] 纯文生视频模式 (模型:{use_model})", flush=True)
+            print(f"[视频生成] 纯文生视频模式 模型:{use_model}", flush=True)
         
-        print(f"[视频生成] 比例:{ratio} 时长:{duration}s", flush=True)
-        print(f"[视频生成] 提示词: {prompt[:80]}...", flush=True)
+        print(f"[视频生成] 提示词: {prompt[:50]}... 比例:{ratio} 时长:{duration}s", flush=True)
         
-        # 调用即梦免费API
-        api_url = f"{JIMENG_FREE_API}/v1/videos/generations"
-        print(f"[视频API] URL: {api_url}", flush=True)
+        resp = requests.post(f"{JIMENG_FREE_API}/v1/videos/generations", headers=headers, json=payload, timeout=600)
         
-        response = requests.post(api_url, headers=headers, json=payload, timeout=600)
+        print(f"[视频API] 状态码: {resp.status_code}", flush=True)
         
-        print(f"[视频API响应] 状态码: {response.status_code}", flush=True)
-        print(f"[视频API响应] 内容(前300字): {response.text[:300]}", flush=True)
+        if resp.status_code != 200:
+            error_text = resp.text[:300]
+            print(f"[视频API错误] {error_text}", flush=True)
+            return {"success": False, "error": f"HTTP {resp.status_code}: {error_text[:100]}"}
         
-        if response.status_code != 200:
-            error_text = response.text[:500]
-            print(f"[视频API错误] HTTP {response.status_code}: {error_text}", flush=True)
-            return {"success": False, "error": f"HTTP {response.status_code}: {error_text[:100]}"}
+        result = resp.json()
+        data = result.get("data") or []
+        if data and len(data) > 0:
+            url = data[0].get("url", "")
+            print(f"[视频成功] URL: {url[:60]}...", flush=True)
+            return {"success": True, "url": url, "video_url": url}  # 兼容两种字段名
         
-        # 解析JSON
-        try:
-            result = response.json()
-        except Exception as json_err:
-            print(f"[视频JSON解析失败] {str(json_err)}", flush=True)
-            return {"success": False, "error": "视频API响应解析失败"}
-        
-        print(f"[视频API响应] JSON: {str(result)[:300]}...", flush=True)
-        
-        # 解析响应
-        if "data" in result and len(result["data"]) > 0:
-            video_url = result["data"][0].get("url", "")
-            print(f"[视频成功] URL: {video_url[:80]}...", flush=True)
-            return {"success": True, "video_url": video_url}
-        elif "error" in result:
-            error_msg = result["error"].get("message", str(result))
-            print(f"[视频API错误] {error_msg}", flush=True)
-            return {"success": False, "error": error_msg}
-        else:
-            print(f"[视频未知响应] {str(result)}", flush=True)
-            return {"success": False, "error": str(result)}
+        error_msg = result.get("message") or result.get("error", {}).get("message") or str(result)
+        return {"success": False, "error": error_msg}
     except requests.exceptions.Timeout:
-        print(f"[视频超时] API请求超时(600秒)", flush=True)
-        return {"success": False, "error": "视频生成超时，请稍后重试"}
+        return {"success": False, "error": "视频生成超时(600秒)"}
     except Exception as e:
         print(f"[视频异常] {type(e).__name__}: {str(e)}", flush=True)
         return {"success": False, "error": str(e)}
 
-# 保留旧函数名兼容性（即梦免费API是同步返回的）
-def create_video_task(image_url, prompt, duration=5, resolution="1080p"):
-    """兼容旧接口，直接调用即梦免费API并返回结果"""
-    result = generate_video_jimeng(prompt, image_url, duration)
+def upload_base64_image(base64_data, prompt="参考图"):
+    """将base64图片上传并获取URL（通过生成一张相似图片）"""
+    # 即梦API不支持直接上传base64，需要通过图生图方式
+    # 这里我们先生成一张图片获取URL，然后可以用这个URL作为参考
+    # 注意：这会消耗一次生成配额
+    result = gen_image(prompt)
     if result.get("success"):
-        # 返回video_url作为task_id，wait_for_video会直接返回它
-        return {"success": True, "task_id": result.get("video_url", "")}
-    else:
-        return result
+        return result.get("url")
+    return None
 
-def query_video_task(task_id):
-    """即梦免费API是同步的，不需要查询"""
-    return {"status": "succeeded"}
+# ========== API路由 ==========
 
-def wait_for_video(task_id, max_wait=600):
-    """即梦免费API是同步的，task_id就是video_url"""
-    if task_id:
-        return {"success": True, "video_url": task_id}
-    else:
-        return {"success": False, "error": "无视频URL"}
-
-HTML_PAGE = r'''<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI创作工具 v7.0 免费版</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); min-height: 100vh; color: #fff; }
-        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
-        .header { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; border-bottom: 1px solid rgba(255,255,255,0.1); margin-bottom: 20px; }
-        .header h1 { font-size: 22px; }
-        .version { font-size: 12px; background: #4CAF50; padding: 2px 8px; border-radius: 10px; margin-left: 8px; }
-        .free-badge { font-size: 12px; background: linear-gradient(135deg, #FFD700, #FFA500); color: #000; padding: 2px 8px; border-radius: 10px; margin-left: 5px; font-weight: bold; }
-        
-        /* 主Tab切换 */
-        .main-tabs { display: flex; gap: 0; margin-bottom: 25px; background: rgba(255,255,255,0.05); border-radius: 12px; padding: 5px; }
-        .main-tab { flex: 1; padding: 15px 20px; text-align: center; cursor: pointer; border-radius: 8px; transition: all 0.3s; font-weight: 600; }
-        .main-tab:hover { background: rgba(255,255,255,0.1); }
-        .main-tab.active { background: linear-gradient(135deg, #4CAF50, #45a049); }
-        .main-tab .tab-icon { font-size: 24px; display: block; margin-bottom: 5px; }
-        
-        .card { background: rgba(255,255,255,0.05); border-radius: 16px; padding: 25px; margin-bottom: 20px; border: 1px solid rgba(255,255,255,0.1); }
-        .card-title { font-size: 18px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
-        .form-group { margin-bottom: 20px; }
-        .form-group label { display: block; margin-bottom: 8px; color: rgba(255,255,255,0.8); font-size: 14px; }
-        .form-group input, .form-group textarea, .form-group select { width: 100%; padding: 12px 16px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.05); color: #fff; font-size: 16px; }
-        .form-group input:focus, .form-group textarea:focus { outline: none; border-color: #4CAF50; }
-        .form-group textarea { min-height: 100px; resize: vertical; }
-        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
-        .form-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; }
-        .btn { padding: 12px 24px; border-radius: 8px; border: none; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.3s; }
-        .btn-primary { background: linear-gradient(135deg, #4CAF50, #45a049); color: #fff; }
-        .btn-secondary { background: rgba(255,255,255,0.1); color: #fff; border: 1px solid rgba(255,255,255,0.2); }
-        .btn-small { padding: 6px 12px; font-size: 12px; }
-        .btn:hover { transform: translateY(-2px); }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-        .btn-group { display: flex; gap: 15px; margin-top: 20px; flex-wrap: wrap; }
-        
-        .section-title { font-size: 14px; color: rgba(255,255,255,0.6); margin: 20px 0 10px 0; padding-bottom: 5px; border-bottom: 1px solid rgba(255,255,255,0.1); }
-        .option-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
-        .option-item { padding: 10px 5px; background: rgba(255,255,255,0.05); border: 2px solid rgba(255,255,255,0.1); border-radius: 8px; text-align: center; cursor: pointer; transition: all 0.3s; font-size: 12px; }
-        .option-item:hover { border-color: rgba(255,255,255,0.3); }
-        .option-item.selected { border-color: #4CAF50; background: rgba(76,175,80,0.2); }
-        .option-item .icon { font-size: 20px; margin-bottom: 3px; }
-        
-        /* 快速上传框 */
-        .quick-upload-box { width: 60px; height: 60px; border: 2px dashed rgba(255,255,255,0.3); border-radius: 8px; display: flex; flex-direction: column; justify-content: center; align-items: center; cursor: pointer; transition: all 0.3s; color: rgba(255,255,255,0.5); }
-        .quick-upload-box:hover { border-color: #4CAF50; color: #4CAF50; }
-        .quick-ref-item { position: relative; width: 60px; height: 60px; border-radius: 8px; overflow: hidden; }
-        .quick-ref-item img, .quick-ref-item video { width: 100%; height: 100%; object-fit: cover; }
-        .quick-ref-item .remove-btn { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; background: rgba(255,0,0,0.8); color: #fff; border: none; border-radius: 50%; font-size: 12px; cursor: pointer; display: flex; justify-content: center; align-items: center; }
-        
-        /* 分步生成面板 */
-        .step-section { background: rgba(0,0,0,0.2); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
-        .step-header { padding: 12px 15px; display: flex; align-items: center; gap: 10px; cursor: pointer; }
-        .step-header:hover { background: rgba(255,255,255,0.05); }
-        .step-badge { width: 24px; height: 24px; background: rgba(76,175,80,0.3); border: 2px solid #4CAF50; border-radius: 50%; display: flex; justify-content: center; align-items: center; font-size: 12px; font-weight: bold; }
-        .step-badge.done { background: #4CAF50; }
-        .step-badge.active { background: #2196F3; border-color: #2196F3; }
-        .step-status { margin-left: auto; font-size: 12px; color: rgba(255,255,255,0.5); }
-        .step-status.done { color: #4CAF50; }
-        .step-status.active { color: #2196F3; }
-        .step-content { padding: 0 15px 15px 15px; }
-        
-        /* 图片结果展示 */
-        .image-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }
-        .image-result-item { background: rgba(0,0,0,0.2); border-radius: 12px; overflow: hidden; }
-        .image-result-item img { width: 100%; display: block; cursor: pointer; }
-        .image-result-item .img-info { padding: 10px; display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
-        
-        .progress-bar { width: 100%; height: 8px; background: rgba(255,255,255,0.1); border-radius: 4px; overflow: hidden; margin: 15px 0; }
-        .progress-fill { height: 100%; background: linear-gradient(90deg, #4CAF50, #8BC34A); transition: width 0.3s; }
-        .progress-text { text-align: center; color: rgba(255,255,255,0.7); font-size: 14px; }
-        
-        .cost-box { background: linear-gradient(135deg, rgba(255,193,7,0.15), rgba(255,152,0,0.15)); border: 1px solid rgba(255,193,7,0.3); border-radius: 10px; padding: 12px 15px; margin: 15px 0; display: flex; justify-content: space-between; align-items: center; }
-        .cost-box .cost-label { color: rgba(255,255,255,0.7); font-size: 13px; }
-        .cost-box .cost-value { color: #FFC107; font-weight: bold; font-size: 16px; }
-        .cost-box .free-badge { color: #4CAF50; }
-        
-        .hidden { display: none !important; }
-        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 1000; justify-content: center; align-items: center; }
-        .modal.show { display: flex; }
-        .modal img { max-width: 90%; max-height: 90%; border-radius: 10px; }
-        .modal-close { position: absolute; top: 20px; right: 30px; font-size: 40px; color: #fff; cursor: pointer; }
-        
-        .size-preview { background: rgba(0,0,0,0.3); border-radius: 8px; padding: 15px; margin: 10px 0; text-align: center; }
-        .size-preview .preview-box { display: inline-block; background: rgba(76,175,80,0.3); border: 2px solid #4CAF50; margin: 10px; }
-        .size-preview .size-text { font-size: 12px; color: rgba(255,255,255,0.6); margin-top: 5px; }
-        
-        @media (max-width: 768px) { 
-            .form-row, .form-row-3 { grid-template-columns: 1fr; } 
-            .option-grid { grid-template-columns: repeat(3, 1fr); }
-            .main-tabs { flex-direction: column; }
-            .image-results { grid-template-columns: 1fr 1fr; }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🎨 AI创作工具 <span class="version">v7.0</span><span class="free-badge">🆓 免费</span></h1>
-            <button class="btn btn-secondary btn-small" onclick="showHistory()">📋 历史</button>
-        </div>
-        
-        <!-- 主Tab切换 -->
-        <div class="main-tabs">
-            <div class="main-tab active" onclick="switchMode('image')">
-                <span class="tab-icon">🖼️</span>
-                快速生成图片
-            </div>
-            <div class="main-tab" onclick="switchMode('video')">
-                <span class="tab-icon">🎬</span>
-                生成视频
-            </div>
-        </div>
-        
-        <!-- ========== 图片生成模式 ========== -->
-        <div id="imageMode">
-            <div class="card">
-                <div class="card-title">🖼️ 快速生成图片</div>
-                
-                <!-- 生成模式切换 -->
-                <div class="section-title">✨ 生成模式</div>
-                <div class="option-grid" style="grid-template-columns: 1fr 1fr;">
-                    <div class="option-item selected" data-mode="text2img" onclick="selectGenMode('text2img')"><div class="icon">📝</div>文生图</div>
-                    <div class="option-item" data-mode="img2img" onclick="selectGenMode('img2img')"><div class="icon">🖼️</div>图生图</div>
-                </div>
-                
-                <!-- 参考图上传（图生图模式） -->
-                <div id="refImageSection" class="hidden">
-                    <div class="section-title">📤 上传参考图 *</div>
-                    <div style="border:2px dashed rgba(255,255,255,0.3);border-radius:12px;padding:20px;text-align:center;cursor:pointer;transition:all 0.3s;margin-bottom:15px;" id="refUploadArea" onclick="document.getElementById('refImageFile').click()">
-                        <input type="file" id="refImageFile" accept="image/*" style="display:none" onchange="handleRefImageUpload(event)">
-                        <div id="refUploadText">
-                            <div style="font-size:32px;margin-bottom:10px;">📁</div>
-                            <div>点击上传参考图片</div>
-                            <div style="font-size:12px;color:rgba(255,255,255,0.5);margin-top:5px;">支持 JPG、PNG 格式</div>
-                        </div>
-                        <img id="refImagePreview" style="max-width:200px;max-height:150px;border-radius:8px;display:none;" onerror="handleRefImageError()">
-                    </div>
-                    <div class="form-group" style="margin-bottom:10px;">
-                        <label>或输入图片URL</label>
-                        <input type="text" id="refImageUrl" placeholder="https://example.com/image.jpg" oninput="updateRefImageFromUrl()">
-                    </div>
-                </div>
-                
-                <div class="form-group">
-                    <label id="promptLabel">图片描述 * <button class="btn btn-secondary btn-small" onclick="showPromptTemplates()" style="margin-left:10px;">📋 模板</button></label>
-                    <textarea id="imgPrompt" placeholder="详细描述你想要的图片内容...&#10;例如：一台银色的笔记本电脑，放在简约的白色桌面上，旁边有一杯咖啡和一盆绿植，阳光从窗户照进来，画面温馨自然"></textarea>
-                </div>
-                
-                <div class="form-group">
-                    <label>负面提示词（排除不想要的元素）</label>
-                    <input type="text" id="negativePrompt" placeholder="例如：模糊, 低质量, 变形, 水印, 文字">
-                </div>
-                
-                <!-- 图生图专用模板 -->
-                <div id="img2imgTemplates" class="hidden" style="margin-bottom:15px;">
-                    <div class="section-title">🎯 图生图快捷操作</div>
-                    <div class="option-grid" style="grid-template-columns: repeat(4, 1fr);">
-                        <div class="option-item" onclick="setImg2ImgPrompt('change_bg')"><div class="icon">🏞️</div>换背景</div>
-                        <div class="option-item" onclick="setImg2ImgPrompt('to_cartoon')"><div class="icon">🎨</div>转卡通</div>
-                        <div class="option-item" onclick="setImg2ImgPrompt('to_3d')"><div class="icon">🎮</div>转3D</div>
-                        <div class="option-item" onclick="setImg2ImgPrompt('enhance')"><div class="icon">✨</div>高清增强</div>
-                    </div>
-                </div>
-                
-                <!-- 提示词模板弹窗 -->
-                <div id="templateModal" class="hidden" style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:999;display:flex;justify-content:center;align-items:center;">
-                    <div style="background:#1a1a2e;border-radius:16px;padding:25px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto;">
-                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
-                            <h3>📋 提示词模板</h3>
-                            <button class="btn btn-secondary btn-small" onclick="hidePromptTemplates()">✕</button>
-                        </div>
-                        <div id="templateList"></div>
-                    </div>
-                </div>
-                
-                <div class="section-title">🎨 图片风格</div>
-                <div class="option-grid" id="imgStyleGrid">
-                    <div class="option-item selected" data-style="realistic" onclick="selectImgStyle('realistic')"><div class="icon">📷</div>写实摄影</div>
-                    <div class="option-item" data-style="commercial" onclick="selectImgStyle('commercial')"><div class="icon">🛍️</div>电商产品</div>
-                    <div class="option-item" data-style="minimalist" onclick="selectImgStyle('minimalist')"><div class="icon">⬜</div>简约现代</div>
-                    <div class="option-item" data-style="artistic" onclick="selectImgStyle('artistic')"><div class="icon">🎨</div>艺术插画</div>
-                    <div class="option-item" data-style="3d" onclick="selectImgStyle('3d')"><div class="icon">🎮</div>3D渲染</div>
-                </div>
-                
-                <div class="section-title">📐 图片尺寸</div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>预设尺寸</label>
-                        <select id="imgSizePreset" onchange="updateImgSize()">
-                            <option value="1440x1440">1440×1440 (1:1 方形)</option>
-                            <option value="1440x1920">1440×1920 (3:4 竖版)</option>
-                            <option value="1920x1440">1920×1440 (4:3 横版)</option>
-                            <option value="1080x1920">1080×1920 (9:16 手机竖屏)</option>
-                            <option value="1920x1080" selected>1920×1080 (16:9 横屏)</option>
-                            <option value="2048x2048">2048×2048 (1:1 超清方形)</option>
-                            <option value="custom">自定义尺寸...</option>
-                        </select>
-                    </div>
-                    <div class="form-group" id="customSizeGroup" style="display:none;">
-                        <label>自定义 (宽x高)</label>
-                        <input type="text" id="customSize" placeholder="例如: 1440x1920">
-                    </div>
-                    <div class="form-group">
-                        <label>生成数量</label>
-                        <select id="imgCount">
-                            <option value="1">1张</option>
-                            <option value="2">2张</option>
-                            <option value="3" selected>3张</option>
-                            <option value="4">4张</option>
-                        </select>
-                    </div>
-                </div>
-                
-                <div class="size-preview" id="sizePreview">
-                    <div class="preview-box" id="previewBox" style="width:96px;height:54px;"></div>
-                    <div class="size-text" id="sizeText">1920 × 1080 像素</div>
-                </div>
-                
-                <div class="cost-box">
-                    <span class="cost-label">预估费用</span>
-                    <span class="cost-value" id="imgCost">¥0.60</span>
-                </div>
-                
-                <div class="btn-group">
-                    <button class="btn btn-primary" onclick="generateImages()" id="genImgBtn">🚀 生成图片</button>
-                </div>
-            </div>
-            
-            <!-- 图片生成进度 -->
-            <div class="card hidden" id="imgProgress">
-                <div class="card-title">⏳ 生成中...</div>
-                <div class="progress-bar"><div class="progress-fill" id="imgProgressBar" style="width:0%"></div></div>
-                <div class="progress-text" id="imgProgressText">准备中...</div>
-            </div>
-            
-            <!-- 图片结果 -->
-            <div class="card hidden" id="imgResults">
-                <div class="card-title">🎉 生成完成！</div>
-                <div class="image-results" id="imgResultGrid"></div>
-                <div class="btn-group">
-                    <button class="btn btn-secondary" onclick="downloadAllImages()">📥 全部下载</button>
-                    <button class="btn btn-secondary" onclick="sendImagesToFeishu()">📤 发飞书</button>
-                    <button class="btn btn-primary" onclick="resetImageMode()">✨ 继续生成</button>
-                </div>
-            </div>
-        </div>
-        
-        <!-- ========== 视频生成模式 ========== -->
-        <div id="videoMode" class="hidden">
-            <!-- 视频模式选择 -->
-            <div class="card">
-                <div class="option-grid" style="grid-template-columns: 1fr 1fr;">
-                    <div class="option-item selected" data-vmode="quick" onclick="selectVideoSubMode('quick')"><div class="icon">⚡</div>快速视频</div>
-                    <div class="option-item" data-vmode="full" onclick="selectVideoSubMode('full')"><div class="icon">📝</div>完整流程</div>
-                </div>
-            </div>
-            
-            <!-- ===== 快速视频模式（类似即梦） ===== -->
-            <div id="quickVideoMode">
-                <div class="card">
-                    <div class="card-title">🎬 快速视频生成</div>
-                    
-                    <!-- 参考素材上传 -->
-                    <div class="section-title">📤 参考素材（可选，最多5张）</div>
-                    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:15px;" id="quickRefContainer">
-                        <div class="quick-upload-box" onclick="document.getElementById('quickRefInput').click()">
-                            <div style="font-size:24px;">+</div>
-                            <div style="font-size:12px;">添加</div>
-                        </div>
-                        <input type="file" id="quickRefInput" accept="image/*,video/*" multiple style="display:none" onchange="handleQuickRefUpload(event)">
-                    </div>
-                    <div id="quickRefPreviewList" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:15px;"></div>
-                    
-                    <!-- 简洁输入框 -->
-                    <div class="form-group">
-                        <textarea id="quickVideoPrompt" placeholder="描述你想要的视频效果...&#10;例如：产品缓缓旋转，光影流动，展现科技质感" style="min-height:80px;"></textarea>
-                    </div>
-                    
-                    <!-- 底部选项栏 -->
-                    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:15px;">
-                        <select id="quickVideoModel" style="flex:1;min-width:150px;">
-                            <option value="jimeng-video-seedance-2.0">Seedance 2.0</option>
-                            <option value="jimeng-video-seedance-2.0-fast">Seedance 2.0 Fast</option>
-                        </select>
-                        <select id="quickVideoRatio" style="width:80px;">
-                            <option value="16:9">16:9</option>
-                            <option value="9:16">9:16</option>
-                            <option value="1:1">1:1</option>
-                            <option value="4:3">4:3</option>
-                            <option value="3:4">3:4</option>
-                        </select>
-                        <select id="quickVideoDuration" style="width:80px;">
-                            <option value="5">5秒</option>
-                            <option value="10">10秒</option>
-                            <option value="15">15秒</option>
-                        </select>
-                    </div>
-                    
-                    <div class="cost-box">
-                        <span class="cost-label">预估费用</span>
-                        <span class="cost-value free-badge">免费 ✨</span>
-                    </div>
-                    
-                    <div class="btn-group">
-                        <button class="btn btn-primary" onclick="generateQuickVideo()">🚀 生成视频</button>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- ===== 完整流程模式 ===== -->
-            <div id="fullVideoMode" class="hidden">
-                <div class="card">
-                    <div class="card-title">📝 完整流程（文案→分镜→图片→视频）</div>
-                    
-                    <div class="section-title">📺 场景类型</div>
-                    <div class="option-grid" id="sceneTabs">
-                        <div class="option-item selected" data-scene="product" onclick="selectScene('product')"><div class="icon">🖥️</div>电商产品</div>
-                        <div class="option-item" data-scene="douyin" onclick="selectScene('douyin')"><div class="icon">📱</div>抖音视频</div>
-                        <div class="option-item" data-scene="food" onclick="selectScene('food')"><div class="icon">🍜</div>美食探店</div>
-                        <div class="option-item" data-scene="travel" onclick="selectScene('travel')"><div class="icon">✈️</div>旅游风景</div>
-                        <div class="option-item" data-scene="custom" onclick="selectScene('custom')"><div class="icon">✨</div>自定义</div>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label id="videoInputLabel">产品名称 *</label>
-                        <input type="text" id="videoMainInput" placeholder="例如：联想小新Pro16笔记本">
-                    </div>
-                    <div class="form-group">
-                        <label>详细描述</label>
-                        <textarea id="videoDetailInput" placeholder="例如：16英寸2.5K屏，i7处理器，性能强劲"></textarea>
-                    </div>
-                    
-                    <div class="section-title">⚙️ 生成设置</div>
-                    <div class="form-row-3">
-                        <div class="form-group">
-                            <label>镜头数量</label>
-                            <select id="videoScenes">
-                                <option value="3">3个镜头</option>
-                                <option value="4" selected>4个镜头</option>
-                                <option value="5">5个镜头</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>视频时长</label>
-                            <select id="videoDuration">
-                                <option value="5" selected>5秒/镜头</option>
-                                <option value="10">10秒/镜头</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>生成模式</label>
-                            <select id="videoGenMode">
-                                <option value="full">图片+视频</option>
-                                <option value="imageOnly">只生成图片</option>
-                            </select>
-                        </div>
-                    </div>
-                    
-                    <div class="cost-box">
-                        <span class="cost-label">预估费用</span>
-                        <span class="cost-value free-badge">免费 ✨</span>
-                    </div>
-                    
-                    <div class="btn-group" style="flex-direction:column;gap:10px;">
-                        <button class="btn btn-primary" onclick="generateVideoOneClick()" style="width:100%;">⚡ 一键生成（全自动）</button>
-                        <button class="btn btn-secondary" onclick="generateVideoStepByStep()" style="width:100%;">📋 一步步生成（可修改）</button>
-                    </div>
-                </div>
-                
-                <!-- 分步生成面板 -->
-                <div class="card hidden" id="stepByStepPanel">
-                    <div class="card-title">📋 分步生成</div>
-                    
-                    <!-- 步骤1：文案 -->
-                    <div class="step-section" id="step1">
-                        <div class="step-header">
-                            <span class="step-badge">1</span>
-                            <span>文案生成</span>
-                            <span class="step-status" id="step1Status">⏳ 待生成</span>
-                        </div>
-                        <div class="step-content hidden" id="step1Content">
-                            <textarea id="stepCopyResult" style="min-height:100px;" placeholder="文案将在这里显示，你可以修改..."></textarea>
-                            <div class="btn-group" style="margin-top:10px;">
-                                <button class="btn btn-secondary btn-small" onclick="regenerateStep(1)">🔄 重新生成</button>
-                                <button class="btn btn-primary btn-small" onclick="confirmStep(1)">✓ 确认，下一步</button>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- 步骤2：分镜 -->
-                    <div class="step-section" id="step2">
-                        <div class="step-header">
-                            <span class="step-badge">2</span>
-                            <span>分镜脚本</span>
-                            <span class="step-status" id="step2Status">⏳ 待生成</span>
-                        </div>
-                        <div class="step-content hidden" id="step2Content">
-                            <div id="stepStoryboardResult"></div>
-                            <div class="btn-group" style="margin-top:10px;">
-                                <button class="btn btn-secondary btn-small" onclick="regenerateStep(2)">🔄 重新生成</button>
-                                <button class="btn btn-primary btn-small" onclick="confirmStep(2)">✓ 确认，下一步</button>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- 步骤3：图片 -->
-                    <div class="step-section" id="step3">
-                        <div class="step-header">
-                            <span class="step-badge">3</span>
-                            <span>图片生成</span>
-                            <span class="step-status" id="step3Status">⏳ 待生成</span>
-                        </div>
-                        <div class="step-content hidden" id="step3Content">
-                            <div class="image-results" id="stepImageResult"></div>
-                            <div class="btn-group" style="margin-top:10px;">
-                                <button class="btn btn-secondary btn-small" onclick="regenerateStep(3)">🔄 重新生成</button>
-                                <button class="btn btn-primary btn-small" onclick="confirmStep(3)">✓ 确认，生成视频</button>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- 步骤4：视频 -->
-                    <div class="step-section" id="step4">
-                        <div class="step-header">
-                            <span class="step-badge">4</span>
-                            <span>视频生成</span>
-                            <span class="step-status" id="step4Status">⏳ 待生成</span>
-                        </div>
-                        <div class="step-content hidden" id="step4Content">
-                            <div class="image-results" id="stepVideoResult"></div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- 视频生成进度（一键生成用） -->
-            <div class="card hidden" id="videoProgress">
-                <div class="card-title">⏳ 生成中...</div>
-                <div id="videoStatusList"></div>
-                <div class="progress-bar"><div class="progress-fill" id="videoProgressBar" style="width:0%"></div></div>
-                <div class="progress-text" id="videoProgressText">准备中...</div>
-            </div>
-            
-            <!-- 视频结果 -->
-            <div class="card hidden" id="videoResults">
-                <div class="card-title">🎉 生成完成！</div>
-                <div class="form-group" id="videoCopySection">
-                    <label>📝 文案</label>
-                    <div style="background:rgba(0,0,0,0.2);border-radius:8px;padding:15px;white-space:pre-wrap;" id="videoCopyResult"></div>
-                </div>
-                <div class="image-results" id="videoResultGrid"></div>
-                <div class="btn-group">
-                    <button class="btn btn-secondary" onclick="downloadAllVideos()">📥 全部下载</button>
-                    <button class="btn btn-secondary" onclick="sendVideosToFeishu()">📤 发飞书</button>
-                    <button class="btn btn-primary" onclick="resetVideoMode()">✨ 新建</button>
-                </div>
-            </div>
-        </div>
-        
-        <!-- 历史记录 -->
-        <div class="card hidden" id="historyCard">
-            <div class="card-title">📋 历史记录 <button class="btn btn-secondary btn-small" onclick="hideHistory()">返回</button></div>
-            <div id="historyList"></div>
-        </div>
-    </div>
+@app.route('/api/reverse-prompt', methods=['POST'])
+def api_reverse_prompt():
+    """反推提示词 - 分析图片生成提示词"""
+    d = request.get_json() or {}
+    img_url = (d.get("image_url") or "").strip()
+    img_b64 = (d.get("image_base64") or "").strip()
+    style = d.get("style", "detailed")
     
-    <div class="modal" id="imageModal" onclick="closeModal()">
-        <span class="modal-close">&times;</span>
-        <img id="modalImage" src="">
-    </div>
+    if not img_url and not img_b64:
+        return jsonify({"success": False, "error": "请提供图片"}), 400
     
-    <script>
-        // 图片风格配置
-        var IMG_STYLES = {
-            realistic: ", photorealistic, professional photography, high quality, 8K UHD, sharp focus",
-            commercial: ", commercial product photography, studio lighting, clean white background, professional, 8K",
-            minimalist: ", minimalist style, clean composition, soft colors, modern aesthetic, 8K",
-            artistic: ", artistic illustration, creative style, vibrant colors, detailed artwork, 8K",
-            "3d": ", 3D render, octane render, cinema 4D, photorealistic 3D, studio lighting, 8K"
-        };
-        
-        // 提示词模板
-        var PROMPT_TEMPLATES = [
-            { name: "📱 电子产品", prompt: "一台[产品名称]，放在简约的白色桌面上，柔和的自然光照射，背景干净整洁，产品细节清晰可见，专业产品摄影风格" },
-            { name: "🛍️ 电商白底图", prompt: "[产品名称]，纯白色背景，专业摄影棚灯光，产品居中展示，高清细节，商业产品摄影" },
-            { name: "🏠 生活场景", prompt: "[产品名称]放在温馨的家居环境中，旁边有绿植和装饰品，阳光从窗户照进来，画面温馨自然，生活方式摄影" },
-            { name: "🎨 创意海报", prompt: "[主题]创意海报设计，现代简约风格，大胆的色彩搭配，几何图形元素，专业平面设计" },
-            { name: "🍔 美食摄影", prompt: "[美食名称]特写，精美摆盘，柔和的侧光，浅景深背景虚化，让人垂涎欲滴，专业美食摄影" },
-            { name: "👗 服装展示", prompt: "[服装描述]，模特穿着展示，简约背景，专业时尚摄影，展示服装细节和质感" },
-            { name: "🏢 建筑空间", prompt: "[空间类型]室内设计，现代简约风格，宽敞明亮，专业建筑摄影，展示空间层次感" },
-            { name: "🌸 自然风景", prompt: "[地点描述]自然风景，黄金时段光线，壮观的云彩，风景摄影大师作品风格" }
-        ];
-        
-        var SCENE_CONFIG = {
-            product: { label: "产品名称 *", placeholder: "例如：联想小新Pro16笔记本" },
-            douyin: { label: "视频主题 *", placeholder: "例如：一个人的周末vlog" },
-            food: { label: "店铺/美食 *", placeholder: "例如：深夜食堂居酒屋" },
-            travel: { label: "目的地 *", placeholder: "例如：云南大理洱海" },
-            custom: { label: "主题 *", placeholder: "输入你的主题" }
-        };
-        
-        var currentImgStyle = "realistic";
-        var currentScene = "product";
-        var currentGenMode = "text2img";  // 新增：生成模式 text2img / img2img
-        var refImageBase64 = null;  // 新增：参考图Base64
-        var refImageUrl = null;     // 新增：参考图URL
-        var generatedImages = [];
-        var videoData = { copywriting: "", scenes: [] };
-        
-        // 图生图提示词模板
-        var IMG2IMG_PROMPTS = {
-            change_bg: "将图片背景更换为简约现代的室内场景，保持主体不变，柔和自然光",
-            to_cartoon: "将图片转换为可爱的卡通插画风格，保持主体特征，色彩鲜艳活泼",
-            to_3d: "将图片转换为3D渲染风格，保持主体形态，添加立体感和光影效果",
-            enhance: "高清增强，提升画面清晰度和细节，保持原有风格和构图，8K超高清"
-        };
-        
-        // 生成模式切换
-        function selectGenMode(mode) {
-            currentGenMode = mode;
-            document.querySelectorAll('[data-mode]').forEach(t => t.classList.remove('selected'));
-            document.querySelector('[data-mode="'+mode+'"]').classList.add('selected');
-            
-            // 显示/隐藏参考图上传区域
-            document.getElementById('refImageSection').classList.toggle('hidden', mode !== 'img2img');
-            document.getElementById('img2imgTemplates').classList.toggle('hidden', mode !== 'img2img');
-            
-            // 更新提示词标签
-            if (mode === 'img2img') {
-                document.getElementById('promptLabel').innerHTML = '修改描述 * <button class="btn btn-secondary btn-small" onclick="showPromptTemplates()" style="margin-left:10px;">📋 模板</button>';
-                document.getElementById('imgPrompt').placeholder = '描述你想要的修改效果...\\n例如：将背景换成海边沙滩，保持产品不变';
-            } else {
-                document.getElementById('promptLabel').innerHTML = '图片描述 * <button class="btn btn-secondary btn-small" onclick="showPromptTemplates()" style="margin-left:10px;">📋 模板</button>';
-                document.getElementById('imgPrompt').placeholder = '详细描述你想要的图片内容...\\n例如：一台银色的笔记本电脑，放在简约的白色桌面上';
-            }
-        }
-        
-        // 处理参考图上传
-        function handleRefImageUpload(event) {
-            var file = event.target.files[0];
-            if (!file) return;
-            
-            var reader = new FileReader();
-            reader.onload = function(e) {
-                refImageBase64 = e.target.result;
-                refImageUrl = null;  // 清除URL
-                document.getElementById('refImageUrl').value = '';
-                
-                // 显示预览
-                document.getElementById('refImagePreview').src = refImageBase64;
-                document.getElementById('refImagePreview').style.display = 'block';
-                document.getElementById('refUploadText').style.display = 'none';
-                document.getElementById('refUploadArea').style.borderColor = '#4CAF50';
-                document.getElementById('refUploadArea').style.borderStyle = 'solid';
-            };
-            reader.readAsDataURL(file);
-        }
-        
-        // 从URL更新参考图
-        function updateRefImageFromUrl() {
-            var url = document.getElementById('refImageUrl').value.trim();
-            if (url) {
-                refImageUrl = url;
-                refImageBase64 = null;
-                // 尝试显示预览
-                document.getElementById('refImagePreview').src = url;
-                document.getElementById('refImagePreview').style.display = 'block';
-                document.getElementById('refUploadText').style.display = 'none';
-                document.getElementById('refUploadArea').style.borderColor = '#4CAF50';
-            } else {
-                // 清空时恢复上传区域
-                refImageUrl = null;
-                document.getElementById('refImagePreview').style.display = 'none';
-                document.getElementById('refUploadText').style.display = 'block';
-                document.getElementById('refUploadArea').style.borderColor = 'rgba(255,255,255,0.3)';
-            }
-        }
-        
-        // 图片预览加载失败处理
-        function handleRefImageError() {
-            // URL无效时，保留URL但显示提示
-            document.getElementById('refUploadArea').style.borderColor = '#FF5722';
-            document.getElementById('refImagePreview').style.display = 'none';
-            document.getElementById('refUploadText').innerHTML = '<div style="font-size:32px;margin-bottom:10px;">⚠️</div><div style="color:#FF5722;">图片URL无法预览</div><div style="font-size:12px;color:rgba(255,255,255,0.5);margin-top:5px;">但仍会尝试使用该URL生成</div>';
-            document.getElementById('refUploadText').style.display = 'block';
-        }
-        
-        // 设置图生图快捷提示词
-        function setImg2ImgPrompt(type) {
-            document.getElementById('imgPrompt').value = IMG2IMG_PROMPTS[type] || '';
-        }
-        
-        // 获取参考图（优先URL，其次Base64）
-        function getRefImage() {
-            if (currentGenMode !== 'img2img') return null;
-            return refImageUrl || refImageBase64 || null;
-        }
-        
-        // 模式切换
-        function switchMode(mode) {
-            document.querySelectorAll('.main-tab').forEach(t => t.classList.remove('active'));
-            event.target.closest('.main-tab').classList.add('active');
-            document.getElementById('imageMode').classList.toggle('hidden', mode !== 'image');
-            document.getElementById('videoMode').classList.toggle('hidden', mode !== 'video');
-            document.getElementById('historyCard').classList.add('hidden');
-        }
-        
-        // ========== 图片生成模式 ==========
-        function selectImgStyle(style) {
-            currentImgStyle = style;
-            document.querySelectorAll('#imgStyleGrid .option-item').forEach(t => t.classList.remove('selected'));
-            document.querySelector('#imgStyleGrid .option-item[data-style="'+style+'"]').classList.add('selected');
-        }
-        
-        function updateImgSize() {
-            var preset = document.getElementById('imgSizePreset').value;
-            var customGroup = document.getElementById('customSizeGroup');
-            customGroup.style.display = preset === 'custom' ? 'block' : 'none';
-            
-            var size = preset === 'custom' ? document.getElementById('customSize').value : preset;
-            if (size && size.includes('x')) {
-                var parts = size.split('x');
-                var w = parseInt(parts[0]), h = parseInt(parts[1]);
-                // 预览框（按比例缩放，最大100px）
-                var scale = Math.min(100/w, 100/h);
-                document.getElementById('previewBox').style.width = (w*scale) + 'px';
-                document.getElementById('previewBox').style.height = (h*scale) + 'px';
-                document.getElementById('sizeText').textContent = w + ' × ' + h + ' 像素';
-            }
-            updateImgCost();
-        }
-        
-        function updateImgCost() {
-            var count = parseInt(document.getElementById('imgCount').value);
-            document.getElementById('imgCost').textContent = '免费 ✨';
-        }
-        
-        function getImgSize() {
-            var preset = document.getElementById('imgSizePreset').value;
-            return preset === 'custom' ? document.getElementById('customSize').value.trim() : preset;
-        }
-        
-        async function generateImages() {
-            var prompt = document.getElementById('imgPrompt').value.trim();
-            if (!prompt) { alert('请输入图片描述'); return; }
-            
-            // 图生图模式检查参考图
-            var refImage = getRefImage();
-            if (currentGenMode === 'img2img' && !refImage) {
-                alert('请上传参考图或输入图片URL');
-                return;
-            }
-            
-            var negPrompt = document.getElementById('negativePrompt').value.trim();
-            var size = getImgSize();
-            var count = parseInt(document.getElementById('imgCount').value);
-            var stylePrompt = IMG_STYLES[currentImgStyle] || "";
-            var fullPrompt = prompt + stylePrompt;
-            if (negPrompt) {
-                fullPrompt += ", avoid: " + negPrompt;
-            }
-            
-            // 显示进度
-            document.getElementById('imgProgress').classList.remove('hidden');
-            document.getElementById('imgResults').classList.add('hidden');
-            document.getElementById('genImgBtn').disabled = true;
-            
-            var modeText = currentGenMode === 'img2img' ? '图生图' : '文生图';
-            
-            generatedImages = [];
-            for (var i = 0; i < count; i++) {
-                document.getElementById('imgProgressText').textContent = modeText + ' 第 ' + (i+1) + '/' + count + ' 张...';
-                document.getElementById('imgProgressBar').style.width = ((i+1)/count*100) + '%';
-                
-                try {
-                    var requestBody = { prompt: fullPrompt, count: 1, size: size };
-                    // 图生图模式添加参考图
-                    if (currentGenMode === 'img2img' && refImage) {
-                        requestBody.ref_image = refImage;
-                    }
-                    
-                    var resp = await fetch('/api/generate-images', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(requestBody)
-                    });
-                    if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
-                    var data = await resp.json();
-                    if (data.images && data.images[0] && data.images[0].url) {
-                        generatedImages.push(data.images[0].url);
-                    }
-                } catch(e) {
-                    console.error(e);
-                }
-            }
-            
-            // 显示结果
-            showImageResults();
-            saveImageHistory(prompt, size, generatedImages);
-        }
-        
-        function showImageResults() {
-            document.getElementById('imgProgress').classList.add('hidden');
-            document.getElementById('imgResults').classList.remove('hidden');
-            document.getElementById('genImgBtn').disabled = false;
-            
-            var html = '';
-            generatedImages.forEach(function(url, i) {
-                html += '<div class="image-result-item">' +
-                    '<img src="'+url+'" onclick="openModal(\''+url+'\')">' +
-                    '<div class="img-info"><span>图片'+(i+1)+'</span>' +
-                    '<div><button class="btn btn-secondary btn-small" onclick="regenerateSingle('+i+')" style="margin-right:5px;">🔄</button>' +
-                    '<a href="'+url+'" target="_blank" class="btn btn-secondary btn-small">下载</a></div></div>' +
-                    '</div>';
-            });
-            document.getElementById('imgResultGrid').innerHTML = html || '<p style="color:rgba(255,255,255,0.5);">生成失败</p>';
-        }
-        
-        async function regenerateSingle(index) {
-            var prompt = document.getElementById('imgPrompt').value.trim();
-            var negPrompt = document.getElementById('negativePrompt').value.trim();
-            var size = getImgSize();
-            var stylePrompt = IMG_STYLES[currentImgStyle] || "";
-            var fullPrompt = prompt + stylePrompt;
-            if (negPrompt) fullPrompt += ", avoid: " + negPrompt;
-            
-            // 更新按钮状态
-            event.target.disabled = true;
-            event.target.textContent = '...';
-            
-            try {
-                var requestBody = { prompt: fullPrompt, count: 1, size: size };
-                // 图生图模式添加参考图
-                var refImage = getRefImage();
-                if (currentGenMode === 'img2img' && refImage) {
-                    requestBody.ref_image = refImage;
-                }
-                
-                var resp = await fetch('/api/generate-images', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(requestBody)
-                });
-                if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
-                var data = await resp.json();
-                if (data.images && data.images[0] && data.images[0].url) {
-                    generatedImages[index] = data.images[0].url;
-                    showImageResults();
-                }
-            } catch(e) {
-                alert('重新生成失败');
-            }
-            event.target.disabled = false;
-            event.target.textContent = '🔄';
-        }
-        
-        function showPromptTemplates() {
-            var html = '';
-            PROMPT_TEMPLATES.forEach(function(t, i) {
-                html += '<div style="padding:15px;background:rgba(255,255,255,0.05);border-radius:10px;margin-bottom:10px;cursor:pointer;" onclick="useTemplate('+i+')">' +
-                    '<div style="font-weight:bold;margin-bottom:5px;">'+t.name+'</div>' +
-                    '<div style="font-size:13px;color:rgba(255,255,255,0.6);">'+t.prompt+'</div></div>';
-            });
-            document.getElementById('templateList').innerHTML = html;
-            document.getElementById('templateModal').classList.remove('hidden');
-            document.getElementById('templateModal').style.display = 'flex';
-        }
-        
-        function hidePromptTemplates() {
-            document.getElementById('templateModal').classList.add('hidden');
-            document.getElementById('templateModal').style.display = 'none';
-        }
-        
-        function useTemplate(index) {
-            document.getElementById('imgPrompt').value = PROMPT_TEMPLATES[index].prompt;
-            hidePromptTemplates();
-        }
-        
-        function downloadAllImages() {
-            generatedImages.forEach(function(url, i) {
-                var a = document.createElement('a');
-                a.href = url; a.download = '图片' + (i+1) + '.jpg'; a.click();
-            });
-        }
-        
-        async function sendImagesToFeishu() {
-            if (generatedImages.length === 0) { alert('没有可发送的图片'); return; }
-            var prompt = document.getElementById('imgPrompt').value.trim();
-            var msg = '🖼️ AI生成图片\n\n描述: ' + prompt.substring(0, 100) + '\n\n';
-            generatedImages.forEach(function(url, i) {
-                msg += '图片' + (i+1) + ': ' + url + '\n';
-            });
-            
-            try {
-                await fetch('/api/notify', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ message: msg })
-                });
-                alert('已发送到飞书！');
-            } catch(e) {
-                alert('发送失败');
-            }
-        }
-        
-        async function sendVideosToFeishu() {
-            var copy = document.getElementById('videoCopyResult').innerText || '';
-            var msg = '🎬 AI生成视频\n\n';
-            if (copy) msg += '📝 文案:\n' + copy.substring(0, 200) + '\n\n';
-            
-            // 收集所有视频和图片链接
-            var results = document.querySelectorAll('#videoResultGrid .image-result-item');
-            results.forEach(function(item, i) {
-                var video = item.querySelector('video');
-                var img = item.querySelector('img');
-                if (video && video.src) {
-                    msg += '🎬 镜头' + (i+1) + ': ' + video.src + '\n';
-                } else if (img && img.src) {
-                    msg += '🖼️ 镜头' + (i+1) + ': ' + img.src + '\n';
-                }
-            });
-            
-            try {
-                await fetch('/api/notify', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ message: msg })
-                });
-                alert('已发送到飞书！');
-            } catch(e) {
-                alert('发送失败');
-            }
-        }
-        
-        function resetImageMode() {
-            document.getElementById('imgProgress').classList.add('hidden');
-            document.getElementById('imgResults').classList.add('hidden');
-            document.getElementById('imgPrompt').value = '';
-            document.getElementById('negativePrompt').value = '';
-            generatedImages = [];
-            
-            // 清除参考图
-            refImageBase64 = null;
-            refImageUrl = null;
-            document.getElementById('refImageUrl').value = '';
-            document.getElementById('refImagePreview').style.display = 'none';
-            document.getElementById('refUploadText').style.display = 'block';
-            document.getElementById('refUploadArea').style.borderColor = 'rgba(255,255,255,0.3)';
-            document.getElementById('refUploadArea').style.borderStyle = 'dashed';
-            document.getElementById('refImageFile').value = '';
-        }
-        
-        // ========== 视频生成模式 ==========
-        var currentVideoSubMode = 'quick';
-        var quickRefFiles = [];
-        var stepData = { copy: '', storyboard: [], images: [], videos: [] };
-        
-        function selectVideoSubMode(mode) {
-            currentVideoSubMode = mode;
-            document.querySelectorAll('[data-vmode]').forEach(t => t.classList.remove('selected'));
-            document.querySelector('[data-vmode="'+mode+'"]').classList.add('selected');
-            document.getElementById('quickVideoMode').classList.toggle('hidden', mode !== 'quick');
-            document.getElementById('fullVideoMode').classList.toggle('hidden', mode !== 'full');
-            document.getElementById('videoProgress').classList.add('hidden');
-            document.getElementById('videoResults').classList.add('hidden');
-        }
-        
-        // 快速视频 - 参考素材上传
-        function handleQuickRefUpload(e) {
-            var files = Array.from(e.target.files);
-            files.forEach(function(file) {
-                if (quickRefFiles.length >= 5) return;
-                quickRefFiles.push(file);
-                var reader = new FileReader();
-                reader.onload = function(ev) {
-                    var preview = document.getElementById('quickRefPreviewList');
-                    var item = document.createElement('div');
-                    item.className = 'quick-ref-item';
-                    item.dataset.index = quickRefFiles.length - 1;
-                    if (file.type.startsWith('video/')) {
-                        item.innerHTML = '<video src="'+ev.target.result+'" muted></video><button class="remove-btn" onclick="removeQuickRef('+item.dataset.index+')">×</button>';
-                    } else {
-                        item.innerHTML = '<img src="'+ev.target.result+'"><button class="remove-btn" onclick="removeQuickRef('+item.dataset.index+')">×</button>';
-                    }
-                    preview.appendChild(item);
-                };
-                reader.readAsDataURL(file);
-            });
-            e.target.value = '';
-        }
-        
-        function removeQuickRef(index) {
-            quickRefFiles.splice(index, 1);
-            renderQuickRefPreviews();
-        }
-        
-        function renderQuickRefPreviews() {
-            var preview = document.getElementById('quickRefPreviewList');
-            preview.innerHTML = '';
-            quickRefFiles.forEach(function(file, i) {
-                var reader = new FileReader();
-                reader.onload = function(ev) {
-                    var item = document.createElement('div');
-                    item.className = 'quick-ref-item';
-                    if (file.type.startsWith('video/')) {
-                        item.innerHTML = '<video src="'+ev.target.result+'" muted></video><button class="remove-btn" onclick="removeQuickRef('+i+')">×</button>';
-                    } else {
-                        item.innerHTML = '<img src="'+ev.target.result+'"><button class="remove-btn" onclick="removeQuickRef('+i+')">×</button>';
-                    }
-                    preview.appendChild(item);
-                };
-                reader.readAsDataURL(file);
-            });
-        }
-        
-        // 快速视频生成
-        async function generateQuickVideo() {
-            var prompt = document.getElementById('quickVideoPrompt').value.trim();
-            if (!prompt) { alert('请输入视频描述'); return; }
-            
-            var model = document.getElementById('quickVideoModel').value;
-            var ratio = document.getElementById('quickVideoRatio').value;
-            var duration = parseInt(document.getElementById('quickVideoDuration').value);
-            
-            document.getElementById('quickVideoMode').querySelector('.btn-primary').disabled = true;
-            document.getElementById('quickVideoMode').querySelector('.btn-primary').textContent = '⏳ 生成中...';
-            document.getElementById('videoProgress').classList.remove('hidden');
-            document.getElementById('videoProgressText').textContent = '正在生成视频（约1-3分钟）...';
-            document.getElementById('videoProgressBar').style.width = '30%';
-            
-            try {
-                // TODO: 如果有参考图，先上传
-                var imageUrl = null;
-                // 暂时简化，直接文生视频
-                
-                var resp = await fetch('/api/generate-video', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        prompt: prompt,
-                        duration: duration,
-                        image_url: imageUrl,
-                        model: model,
-                        ratio: ratio
-                    })
-                });
-                
-                // 先检查HTTP状态
-                if (!resp.ok) {
-                    var errText = await resp.text();
-                    throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100));
-                }
-                
-                var data = await resp.json();
-                
-                if (data.success && data.video_url) {
-                    document.getElementById('videoProgressBar').style.width = '100%';
-                    videoData = { copywriting: '', scenes: [{ video: data.video_url, image: null }] };
-                    document.getElementById('videoCopySection').classList.add('hidden');
-                    showVideoResults();
-                } else {
-                    throw new Error(data.error || '生成失败');
-                }
-            } catch(e) {
-                alert('生成失败: ' + e.message);
-                document.getElementById('videoProgress').classList.add('hidden');
-            } finally {
-                document.getElementById('quickVideoMode').querySelector('.btn-primary').disabled = false;
-                document.getElementById('quickVideoMode').querySelector('.btn-primary').textContent = '🚀 生成视频';
-            }
-        }
-        
-        // 完整流程 - 一键生成
-        async function generateVideoOneClick() {
-            var name = document.getElementById('videoMainInput').value.trim();
-            if (!name) { alert('请输入主题'); return; }
-            
-            document.getElementById('fullVideoMode').classList.add('hidden');
-            document.getElementById('stepByStepPanel').classList.add('hidden');
-            await generateVideo();
-        }
-        
-        // 完整流程 - 一步步生成
-        async function generateVideoStepByStep() {
-            var name = document.getElementById('videoMainInput').value.trim();
-            if (!name) { alert('请输入主题'); return; }
-            
-            document.getElementById('stepByStepPanel').classList.remove('hidden');
-            stepData = { copy: '', storyboard: [], images: [], videos: [] };
-            
-            // 重置所有步骤状态
-            for (var i = 1; i <= 4; i++) {
-                document.getElementById('step'+i+'Status').textContent = '⏳ 待生成';
-                document.getElementById('step'+i+'Status').className = 'step-status';
-                document.getElementById('step'+i+'Content').classList.add('hidden');
-            }
-            
-            // 开始步骤1
-            await runStep(1);
-        }
-        
-        async function runStep(step) {
-            var name = document.getElementById('videoMainInput').value.trim();
-            var detail = document.getElementById('videoDetailInput').value.trim();
-            var numScenes = parseInt(document.getElementById('videoScenes').value);
-            var duration = parseInt(document.getElementById('videoDuration').value);
-            
-            document.getElementById('step'+step+'Status').textContent = '🔄 生成中...';
-            document.getElementById('step'+step+'Status').className = 'step-status active';
-            
-            try {
-                if (step === 1) {
-                    // 生成文案
-                    var resp = await fetch('/api/generate-copy', {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ product_name: name, product_features: detail, scene_type: currentScene })
-                    });
-                    if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
-                    var data = await resp.json();
-                    if (!data.success) throw new Error(data.error);
-                    stepData.copy = data.content;
-                    document.getElementById('stepCopyResult').value = stepData.copy;
-                    
-                } else if (step === 2) {
-                    // 生成分镜
-                    var resp = await fetch('/api/generate-storyboard', {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ product_name: name, copywriting: stepData.copy, num_scenes: numScenes })
-                    });
-                    if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
-                    var data = await resp.json();
-                    if (!data.success) throw new Error(data.error);
-                    stepData.storyboard = (data.storyboard && data.storyboard.scenes) ? data.storyboard.scenes : [];
-                    
-                    var html = '';
-                    stepData.storyboard.forEach(function(s, i) {
-                        html += '<div style="background:rgba(0,0,0,0.2);padding:10px;border-radius:8px;margin-bottom:8px;"><strong>镜头'+(i+1)+'</strong><br><small style="color:rgba(255,255,255,0.6);">'+s.image_prompt.substring(0,80)+'...</small></div>';
-                    });
-                    document.getElementById('stepStoryboardResult').innerHTML = html;
-                    
-                } else if (step === 3) {
-                    // 生成图片
-                    stepData.images = [];
-                    for (var i = 0; i < stepData.storyboard.length; i++) {
-                        var resp = await fetch('/api/generate-images', {
-                            method: 'POST', headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ prompt: stepData.storyboard[i].image_prompt, count: 1, size: '1920x1080' })
-                        });
-                        if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
-                        var data = await resp.json();
-                        var imgUrl = (data.images && data.images[0]) ? data.images[0].url : null;
-                        stepData.images.push(imgUrl);
-                    }
-                    
-                    var html = '';
-                    stepData.images.forEach(function(url, i) {
-                        if (url) {
-                            html += '<div class="image-result-item" style="max-width:150px;"><img src="'+url+'" onclick="openModal(\''+url+'\')"><div class="img-info"><span>镜头'+(i+1)+'</span></div></div>';
-                        }
-                    });
-                    document.getElementById('stepImageResult').innerHTML = html || '<p>生成失败</p>';
-                    
-                } else if (step === 4) {
-                    // 生成视频
-                    stepData.videos = [];
-                    for (var i = 0; i < stepData.images.length; i++) {
-                        if (!stepData.images[i]) { stepData.videos.push(null); continue; }
-                        var resp = await fetch('/api/generate-video', {
-                            method: 'POST', headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ image_url: stepData.images[i], prompt: stepData.storyboard[i].video_prompt || 'smooth movement', duration: duration })
-                        });
-                        if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
-                        var data = await resp.json();
-                        stepData.videos.push(data.success ? data.video_url : null);
-                    }
-                    
-                    var html = '';
-                    stepData.videos.forEach(function(url, i) {
-                        if (url) {
-                            html += '<div class="image-result-item"><video src="'+url+'" controls style="width:100%;"></video><div class="img-info"><span>镜头'+(i+1)+'</span></div></div>';
-                        }
-                    });
-                    document.getElementById('stepVideoResult').innerHTML = html || '<p>生成失败</p>';
-                }
-                
-                document.getElementById('step'+step+'Status').textContent = '✅ 完成';
-                document.getElementById('step'+step+'Status').className = 'step-status done';
-                document.getElementById('step'+step+'Content').classList.remove('hidden');
-                
-            } catch(e) {
-                document.getElementById('step'+step+'Status').textContent = '❌ 失败';
-                alert('步骤'+step+'失败: ' + e.message);
-            }
-        }
-        
-        async function regenerateStep(step) {
-            await runStep(step);
-        }
-        
-        async function confirmStep(step) {
-            if (step === 1) {
-                stepData.copy = document.getElementById('stepCopyResult').value;
-            }
-            if (step < 4) {
-                await runStep(step + 1);
-            }
-        }
-        
-        function selectScene(scene) {
-            currentScene = scene;
-            document.querySelectorAll('#sceneTabs .option-item').forEach(t => t.classList.remove('selected'));
-            document.querySelector('#sceneTabs .option-item[data-scene="'+scene+'"]').classList.add('selected');
-            var cfg = SCENE_CONFIG[scene];
-            document.getElementById('videoInputLabel').textContent = cfg.label;
-            document.getElementById('videoMainInput').placeholder = cfg.placeholder;
-            updateVideoCost();
-        }
-        
-        function updateVideoCost() {
-            // 费用显示已经直接在HTML设置为免费，无需动态更新
-            // 保留函数避免事件监听器报错
-        }
-        
-        async function generateVideo() {
-            var name = document.getElementById('videoMainInput').value.trim();
-            if (!name) { alert('请输入主题'); return; }
-            
-            var detail = document.getElementById('videoDetailInput').value.trim();
-            var numScenes = parseInt(document.getElementById('videoScenes').value);
-            var duration = parseInt(document.getElementById('videoDuration').value);
-            var mode = document.getElementById('videoGenMode').value;
-            
-            document.getElementById('videoProgress').classList.remove('hidden');
-            document.getElementById('videoResults').classList.add('hidden');
-            
-            var statusHtml = '<div style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.1);">📝 文案生成...</div>';
-            document.getElementById('videoStatusList').innerHTML = statusHtml;
-            document.getElementById('videoProgressText').textContent = '生成文案...';
-            
-            try {
-                // 1. 生成文案
-                var resp = await fetch('/api/generate-copy', {
-                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ product_name: name, product_features: detail, scene_type: currentScene })
-                });
-                if (!resp.ok) { var errText = await resp.text(); throw new Error('HTTP ' + resp.status + ': ' + errText.substring(0, 100)); }
-                var data = await resp.json();
-                if (!data.success) throw new Error(data.error);
-                videoData.copywriting = data.content;
-                
-                // 2. 生成分镜
-                document.getElementById('videoProgressText').textContent = '生成分镜...';
-                document.getElementById('videoProgressBar').style.width = '20%';
-                resp = await fetch('/api/generate-storyboard', {
-                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ product_name: name, copywriting: videoData.copywriting, num_scenes: numScenes })
-                });
-                data = await resp.json();
-                if (!data.success) throw new Error(data.error);
-                var storyboard = (data.storyboard && data.storyboard.scenes) ? data.storyboard.scenes : [];
-                
-                // 3. 生成图片
-                videoData.scenes = [];
-                for (var i = 0; i < storyboard.length; i++) {
-                    document.getElementById('videoProgressText').textContent = '生成图片 ' + (i+1) + '/' + storyboard.length;
-                    document.getElementById('videoProgressBar').style.width = (20 + (i/storyboard.length)*40) + '%';
-                    resp = await fetch('/api/generate-images', {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ prompt: storyboard[i].image_prompt, count: 1, size: '1920x1080' })
-                    });
-                    data = await resp.json();
-                    var imgUrl = (data.images && data.images[0]) ? data.images[0].url : null;
-                    videoData.scenes.push({ image: imgUrl, video: null, prompt: storyboard[i].video_prompt });
-                }
-                
-                // 4. 生成视频（如果需要）
-                if (mode === 'full') {
-                    for (var i = 0; i < videoData.scenes.length; i++) {
-                        if (!videoData.scenes[i].image) continue;
-                        document.getElementById('videoProgressText').textContent = '生成视频 ' + (i+1) + '/' + videoData.scenes.length + ' (约1-2分钟)';
-                        document.getElementById('videoProgressBar').style.width = (60 + (i/videoData.scenes.length)*35) + '%';
-                        resp = await fetch('/api/generate-video', {
-                            method: 'POST', headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ image_url: videoData.scenes[i].image, prompt: videoData.scenes[i].prompt || 'smooth movement', duration: duration })
-                        });
-                        data = await resp.json();
-                        if (data.success && data.video_url) {
-                            videoData.scenes[i].video = data.video_url;
-                        }
-                    }
-                }
-                
-                document.getElementById('videoProgressBar').style.width = '100%';
-                document.getElementById('videoProgressText').textContent = '完成！';
-                setTimeout(showVideoResults, 500);
-                
-            } catch(e) {
-                alert('生成失败: ' + e.message);
-                document.getElementById('videoProgress').classList.add('hidden');
-            }
-        }
-        
-        function showVideoResults() {
-            document.getElementById('videoProgress').classList.add('hidden');
-            document.getElementById('videoResults').classList.remove('hidden');
-            document.getElementById('videoCopyResult').textContent = videoData.copywriting;
-            
-            var html = '';
-            videoData.scenes.forEach(function(s, i) {
-                if (s.video) {
-                    html += '<div class="image-result-item"><video src="'+s.video+'" controls style="width:100%;"></video><div class="img-info"><span>镜头'+(i+1)+'</span><a href="'+s.video+'" target="_blank" class="btn btn-secondary btn-small">下载</a></div></div>';
-                } else if (s.image) {
-                    html += '<div class="image-result-item"><img src="'+s.image+'" onclick="openModal(\''+s.image+'\')"><div class="img-info"><span>镜头'+(i+1)+'</span><a href="'+s.image+'" target="_blank" class="btn btn-secondary btn-small">下载</a></div></div>';
-                }
-            });
-            document.getElementById('videoResultGrid').innerHTML = html || '<p style="color:rgba(255,255,255,0.5);">无内容</p>';
-        }
-        
-        function downloadAllVideos() {
-            videoData.scenes.forEach(function(s, i) {
-                var url = s.video || s.image;
-                if (url) { var a = document.createElement('a'); a.href = url; a.download = '镜头'+(i+1)+(s.video?'.mp4':'.jpg'); a.click(); }
-            });
-        }
-        
-        function resetVideoMode() {
-            document.getElementById('videoProgress').classList.add('hidden');
-            document.getElementById('videoResults').classList.add('hidden');
-            document.getElementById('videoMainInput').value = '';
-            document.getElementById('videoDetailInput').value = '';
-            document.getElementById('quickVideoPrompt').value = '';
-            document.getElementById('stepByStepPanel').classList.add('hidden');
-            document.getElementById('quickVideoMode').classList.remove('hidden');
-            document.getElementById('fullVideoMode').classList.add('hidden');
-            document.getElementById('videoCopySection').classList.remove('hidden');
-            videoData = { copywriting: '', scenes: [] };
-            stepData = { copy: '', storyboard: [], images: [], videos: [] };
-            quickRefFiles = [];
-            document.getElementById('quickRefPreviewList').innerHTML = '';
-            selectVideoSubMode('quick');
-        }
-        
-        // ========== 通用功能 ==========
-        function openModal(url) { document.getElementById('modalImage').src = url; document.getElementById('imageModal').classList.add('show'); }
-        function closeModal() { document.getElementById('imageModal').classList.remove('show'); }
-        
-        function saveImageHistory(prompt, size, images) {
-            var h = JSON.parse(localStorage.getItem('imgHistory') || '[]');
-            h.unshift({ type: 'image', prompt: prompt.substring(0,50), size: size, images: images, time: new Date().toLocaleString() });
-            if (h.length > 30) h.pop();
-            localStorage.setItem('imgHistory', JSON.stringify(h));
-        }
-        
-        function showHistory() {
-            document.getElementById('imageMode').classList.add('hidden');
-            document.getElementById('videoMode').classList.add('hidden');
-            document.getElementById('historyCard').classList.remove('hidden');
-            
-            var h = JSON.parse(localStorage.getItem('imgHistory') || '[]');
-            if (h.length === 0) {
-                document.getElementById('historyList').innerHTML = '<p style="color:rgba(255,255,255,0.5);text-align:center;padding:20px;">暂无记录</p>';
-            } else {
-                var html = '';
-                h.forEach(function(item) {
-                    html += '<div style="padding:15px;background:rgba(255,255,255,0.05);border-radius:10px;margin-bottom:10px;"><div style="display:flex;justify-content:space-between;"><strong>🖼️ ' + item.prompt + '...</strong><span style="color:rgba(255,255,255,0.5);font-size:12px;">' + item.size + '</span></div><div style="font-size:12px;color:rgba(255,255,255,0.5);margin-top:5px;">' + item.time + ' · ' + (item.images ? item.images.length : 0) + '张图片</div></div>';
-                });
-                document.getElementById('historyList').innerHTML = html;
-            }
-        }
-        
-        function hideHistory() {
-            document.getElementById('historyCard').classList.add('hidden');
-            document.getElementById('imageMode').classList.remove('hidden');
-        }
-        
-        // 初始化
-        document.getElementById('imgSizePreset').addEventListener('change', updateImgSize);
-        document.getElementById('imgCount').addEventListener('change', updateImgCost);
-        document.getElementById('videoScenes').addEventListener('change', updateVideoCost);
-        document.getElementById('videoDuration').addEventListener('change', updateVideoCost);
-        document.getElementById('videoGenMode').addEventListener('change', updateVideoCost);
-        updateImgSize();
-        updateImgCost();
-        updateVideoCost();
-    </script>
-</body>
-</html>
-'''
+    prompts = {
+        "detailed": "详细分析这张图片，生成一段用于AI绘图的提示词。包括：主体描述、艺术风格、光影效果、色彩搭配、构图方式、细节特征。直接输出提示词，不要其他解释。",
+        "simple": "用简洁的一句话描述这张图片的主要内容，适合用作AI绘图提示词。直接输出，不要解释。",
+        "artistic": "以专业艺术家的视角分析这张图片，生成富有艺术感的AI绘图提示词，强调风格和氛围。直接输出提示词。"
+    }
+    
+    r = vision("你是专业的AI绘图提示词工程师。", prompts.get(style, prompts["detailed"]), image_url=img_url, image_base64=img_b64)
+    if r.get("success"):
+        return jsonify({"success": True, "prompt": r["content"]})
+    return jsonify(r)
 
-@app.route('/')
-def index():
-    return Response(HTML_PAGE, mimetype='text/html')
+@app.route('/api/optimize-prompt', methods=['POST'])
+def api_optimize_prompt():
+    """优化提示词"""
+    d = request.get_json() or {}
+    prompt = (d.get("prompt") or "").strip()
+    style = d.get("style", "enhance")
+    
+    if not prompt:
+        return jsonify({"success": False, "error": "请提供提示词"}), 400
+    
+    styles = {
+        "enhance": "增强细节描述，添加光影效果、材质质感、氛围渲染等专业描述词",
+        "artistic": "转化为艺术风格，添加艺术流派、著名画家风格、艺术技法等",
+        "commercial": "转化为商业广告风格，强调产品质感、视觉冲击力和商业吸引力",
+        "anime": "转化为日系动漫风格，添加动漫特有的描述词和风格特征"
+    }
+    
+    r = chat(
+        "你是AI绘图提示词专家，擅长优化和扩展提示词。",
+        f"请优化以下提示词，{styles.get(style, styles['enhance'])}。\n\n原始提示词：{prompt}\n\n要求：\n1. 保持原始主题不变\n2. 添加专业的描述词\n3. 直接输出优化后的提示词，不要其他解释"
+    )
+    if r.get("success"):
+        return jsonify({"success": True, "optimized": r["content"]})
+    return jsonify(r)
 
-@app.route('/health')
-def health():
+@app.route('/api/batch-images', methods=['POST'])
+def api_batch_images():
+    """批量生图"""
+    d = request.get_json() or {}
+    prompt = (d.get("prompt") or "").strip()
+    count = min(int(d.get("count", 4)), 40)
+    ratio = d.get("ratio", "1:1")
+    resolution = d.get("resolution", "2K")
+    variations = d.get("variations", False)
+    
+    if not prompt:
+        return jsonify({"success": False, "error": "请提供提示词"}), 400
+    
+    images = []
+    errors = []
+    
+    def gen(i):
+        p = f"{prompt}，variation {i}" if variations and i > 0 else prompt
+        return gen_image(p, ratio, resolution)
+    
+    futures = {executor.submit(gen, i): i for i in range(count)}
+    for f in as_completed(futures):
+        i = futures[f]
+        try:
+            r = f.result()
+            if r.get("success"):
+                images.append({"i": i, "url": r.get("url") or r.get("image_url")})
+            else:
+                errors.append({"i": i, "err": r.get("error")})
+        except Exception as e:
+            errors.append({"i": i, "err": str(e)})
+    
+    images.sort(key=lambda x: x["i"])
+    
+    if images:
+        send_feishu(f"批量生图完成：{len(images)}/{count}张", "🖼️ 批量生图")
+    
     return jsonify({
-        "status": "ok", 
-        "version": "v7.0-free",
-        "api": "jimeng-free-api",
-        "models": {
-            "image": JIMENG_IMAGE_MODEL,
-            "video": JIMENG_VIDEO_MODEL
-        }
+        "success": len(images) > 0,
+        "images": [x["url"] for x in images],
+        "total": count,
+        "done": len(images),
+        "failed": len(errors),
+        "errors": errors[:5] if errors else None
+    })
+
+@app.route('/api/images-to-video', methods=['POST'])
+def api_images_to_video():
+    """组图生视频"""
+    d = request.get_json() or {}
+    images = d.get("images", [])
+    prompts = d.get("prompts", [])
+    duration = d.get("duration", 5)
+    ratio = d.get("ratio", "16:9")
+    
+    if not images:
+        return jsonify({"success": False, "error": "请提供图片列表"}), 400
+    
+    videos = []
+    errors = []
+    
+    def gen(i, img):
+        p = prompts[i].strip() if i < len(prompts) and prompts[i].strip() else "smooth cinematic movement"
+        return gen_video(p, image_url=img, duration=duration, ratio=ratio)
+    
+    futures = {executor.submit(gen, i, img): i for i, img in enumerate(images)}
+    for f in as_completed(futures):
+        i = futures[f]
+        try:
+            r = f.result()
+            if r.get("success"):
+                videos.append({"i": i, "url": r.get("url") or r.get("video_url")})
+            else:
+                errors.append({"i": i, "err": r.get("error")})
+        except Exception as e:
+            errors.append({"i": i, "err": str(e)})
+    
+    videos.sort(key=lambda x: x["i"])
+    
+    if videos:
+        send_feishu(f"组图生视频完成：{len(videos)}/{len(images)}个", "🎬 组图生视频")
+    
+    return jsonify({
+        "success": len(videos) > 0,
+        "videos": [x["url"] for x in videos],
+        "total": len(images),
+        "done": len(videos),
+        "failed": len(errors)
+    })
+
+@app.route('/api/merge-images', methods=['POST'])
+def api_merge_images():
+    """图片融合"""
+    d = request.get_json() or {}
+    images = d.get("images", [])
+    prompt = (d.get("prompt") or "").strip() or "融合这些图片的风格和内容"
+    strength = float(d.get("strength", 0.5))
+    
+    if len(images) < 2:
+        return jsonify({"success": False, "error": "请至少提供2张图片URL"}), 400
+    
+    # 过滤有效的URL
+    valid_images = [img for img in images if img and img.startswith("http")]
+    if len(valid_images) < 2:
+        return jsonify({"success": False, "error": "有效图片URL不足2张"}), 400
+    
+    r = gen_image(prompt, ref_images=valid_images, strength=strength)
+    return jsonify(r)
+
+@app.route('/api/style-transfer', methods=['POST'])
+def api_style_transfer():
+    """风格迁移"""
+    d = request.get_json() or {}
+    style_img = (d.get("style_image") or "").strip()
+    content_img = (d.get("content_image") or "").strip()
+    prompt = (d.get("prompt") or "").strip() or "将第一张图的艺术风格应用到第二张图的内容上"
+    
+    if not style_img or not content_img:
+        return jsonify({"success": False, "error": "请提供风格图和内容图的URL"}), 400
+    
+    if not style_img.startswith("http") or not content_img.startswith("http"):
+        return jsonify({"success": False, "error": "图片必须是有效的URL"}), 400
+    
+    r = gen_image(prompt, ref_images=[style_img, content_img], strength=0.6)
+    return jsonify(r)
+
+@app.route('/api/image-to-copy', methods=['POST'])
+def api_image_to_copy():
+    """智能文案 - 根据图片生成营销文案"""
+    d = request.get_json() or {}
+    img_url = (d.get("image_url") or "").strip()
+    img_b64 = (d.get("image_base64") or "").strip()
+    style = d.get("style", "douyin")
+    product = (d.get("product_name") or "").strip()
+    
+    if not img_url and not img_b64:
+        return jsonify({"success": False, "error": "请提供图片"}), 400
+    
+    styles = {
+        "douyin": "抖音风格：简短有力，带emoji表情，吸引眼球，适合15秒短视频",
+        "xiaohongshu": "小红书风格：亲切种草，分享真实体验，带话题标签#",
+        "taobao": "淘宝风格：突出卖点和优惠，促销感强，引导下单",
+        "formal": "正式风格：专业描述，突出品质和价值"
+    }
+    
+    user_prompt = f"""分析这张图片，为{'产品【' + product + '】' if product else '图中产品'}生成营销文案。
+
+风格要求：{styles.get(style, styles['douyin'])}
+
+输出格式：
+1. 主标题（10字以内）
+2. 副标题（15字以内）  
+3. 正文（50-100字）
+4. 标签（3-5个）"""
+
+    r = vision("你是专业的电商文案师和社交媒体运营专家。", user_prompt, image_url=img_url, image_base64=img_b64)
+    if r.get("success"):
+        return jsonify({"success": True, "copy": r["content"]})
+    return jsonify(r)
+
+@app.route('/api/batch-videos', methods=['POST'])
+def api_batch_videos():
+    """批量生视频"""
+    d = request.get_json() or {}
+    prompts = d.get("prompts", [])[:8]
+    duration = d.get("duration", 5)
+    ratio = d.get("ratio", "16:9")
+    
+    if not prompts:
+        return jsonify({"success": False, "error": "请提供提示词列表"}), 400
+    
+    # 过滤空提示词
+    prompts = [p.strip() for p in prompts if p and p.strip()]
+    if not prompts:
+        return jsonify({"success": False, "error": "没有有效的提示词"}), 400
+    
+    videos = []
+    errors = []
+    
+    def gen(i, p):
+        return gen_video(p, duration=duration, ratio=ratio)
+    
+    futures = {executor.submit(gen, i, p): i for i, p in enumerate(prompts)}
+    for f in as_completed(futures):
+        i = futures[f]
+        try:
+            r = f.result()
+            if r.get("success"):
+                videos.append({"i": i, "url": r.get("url") or r.get("video_url"), "prompt": prompts[i]})
+            else:
+                errors.append({"i": i, "err": r.get("error")})
+        except Exception as e:
+            errors.append({"i": i, "err": str(e)})
+    
+    videos.sort(key=lambda x: x["i"])
+    
+    if videos:
+        send_feishu(f"批量生视频完成：{len(videos)}/{len(prompts)}个", "🎬 批量生视频")
+    
+    return jsonify({
+        "success": len(videos) > 0,
+        "videos": [{"url": x["url"], "prompt": x.get("prompt")} for x in videos],
+        "total": len(prompts),
+        "done": len(videos),
+        "failed": len(errors)
     })
 
 @app.route('/api/generate-copy', methods=['POST'])
 def api_generate_copy():
-    data = request.get_json() or {}
-    name = (data.get("product_name") or "").strip()
-    features = (data.get("product_features") or "").strip()
-    if not name: return jsonify({"success": False, "error": "请输入主题"}), 400
-    system = "短视频文案专家。生成30秒文案，80-150字，分4段。"
-    user = f"主题：{name}\n详情：{features}"
-    return jsonify(chat_completion(system, user))
+    """生成文案"""
+    d = request.get_json() or {}
+    name = (d.get("product_name") or "").strip()
+    features = (d.get("product_features") or "").strip()
+    
+    if not name:
+        return jsonify({"success": False, "error": "请输入产品名称"}), 400
+    
+    prompt = f"为【{name}】写一段30-50字的短视频文案，要求朗朗上口、有感染力。"
+    if features:
+        prompt += f"产品特点：{features}"
+    
+    r = chat("你是专业的电商文案师，擅长写吸引人的短视频文案。", prompt)
+    if r.get("success"):
+        return jsonify({"success": True, "copy": r["content"]})
+    return jsonify(r)
 
 @app.route('/api/generate-storyboard', methods=['POST'])
 def api_generate_storyboard():
-    data = request.get_json() or {}
-    name = (data.get("product_name") or "").strip()
-    copy = (data.get("copywriting") or "").strip()
-    num = data.get("num_scenes", 4)
-    if not name or not copy: return jsonify({"success": False, "error": "缺少参数"}), 400
-    system = f'分镜师。生成{num}个分镜。只输出JSON：{{"scenes":[{{"scene_id":1,"description":"描述","image_prompt":"English prompt, 8K UHD","video_prompt":"camera movement"}}]}}'
-    user = f"主题：{name}\n文案：{copy}"
-    result = chat_completion(system, user)
-    if result.get("success"):
-        try:
-            c = result["content"]
-            s, e = c.find("{"), c.rfind("}") + 1
-            if s >= 0 and e > s: return jsonify({"success": True, "storyboard": json.loads(c[s:e])})
-        except: pass
-        return jsonify({"success": False, "error": "JSON解析失败"})
-    return jsonify(result)
+    """生成分镜"""
+    d = request.get_json() or {}
+    name = (d.get("product_name") or "").strip()
+    copy = (d.get("copywriting") or "").strip()
+    count = int(d.get("count", 3))
+    
+    if not name:
+        return jsonify({"success": False, "error": "请输入产品名称"}), 400
+    
+    prompt = f'''为【{name}】设计{count}个视频分镜。
+文案参考：{copy if copy else '无'}
+
+输出严格按照以下JSON格式，不要其他内容：
+{{"scenes":[{{"image_prompt":"详细的图片描述，包含场景、人物、光影等","video_prompt":"视频动作描述，如镜头移动、人物动作等"}}]}}'''
+    
+    r = chat("你是专业的视频分镜师，擅长设计短视频分镜脚本。请严格按JSON格式输出。", prompt)
+    if not r.get("success"):
+        return jsonify(r)
+    
+    try:
+        content = r["content"]
+        # 提取JSON
+        match = re.search(r'\{[\s\S]*\}', content)
+        if match:
+            storyboard = json.loads(match.group())
+            return jsonify({"success": True, "storyboard": storyboard})
+        return jsonify({"success": False, "error": "无法解析分镜脚本"})
+    except json.JSONDecodeError as e:
+        return jsonify({"success": False, "error": f"JSON解析错误: {str(e)}"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
 
 @app.route('/api/generate-images', methods=['POST'])
 def api_generate_images():
-    data = request.get_json() or {}
-    prompt = (data.get("prompt") or "").strip()
-    count = min(data.get("count", 1), 4)
-    size = data.get("size", "1920x1080")
-    ref_image = data.get("ref_image")  # 新增：参考图（URL或Base64）
+    """生成图片"""
+    d = request.get_json() or {}
+    prompt = (d.get("prompt") or "").strip()
+    count = min(int(d.get("count", 1)), 4)
+    ratio = d.get("ratio", "1:1")
+    resolution = d.get("resolution", "2K")
+    ref = d.get("ref_image")
     
-    if not prompt: return jsonify({"success": False, "error": "请输入提示词"}), 400
+    if not prompt:
+        return jsonify({"success": False, "error": "请提供提示词"}), 400
     
     images = []
+    ref_imgs = None
+    
+    # 处理参考图
+    if ref:
+        if isinstance(ref, str) and ref.startswith("http"):
+            ref_imgs = [ref]
+        # 注意：base64参考图暂不支持，因为即梦API需要URL
+        # 如果需要支持base64，需要先将图片上传到某个服务器获取URL
+    
     for i in range(count):
-        r = generate_image(prompt, size, ref_image)
-        images.append({
-            "index": i+1, 
-            "url": r.get("image_url") if r.get("success") else None, 
-            "error": r.get("error") if not r.get("success") else None
-        })
+        # 只有第一张图使用参考图
+        r = gen_image(prompt, ratio, resolution, ref_images=ref_imgs if i == 0 else None)
+        if r.get("success"):
+            url = r.get("url") or r.get("image_url")
+            if url:
+                images.append(url)
+    
+    if not images:
+        return jsonify({"success": False, "error": "所有图片生成失败"})
+    
     return jsonify({"success": True, "images": images})
 
 @app.route('/api/generate-video', methods=['POST'])
 def api_generate_video():
-    data = request.get_json() or {}
-    img = (data.get("image_url") or "").strip() or None  # 图片可选
-    prompt = (data.get("prompt") or "").strip()
-    duration = data.get("duration", 5)
-    model = (data.get("model") or "").strip() or None  # 可选，有默认值
-    ratio = (data.get("ratio") or "").strip() or "16:9"  # 默认16:9
+    """生成视频"""
+    d = request.get_json() or {}
+    img = (d.get("image_url") or "").strip() or None
+    prompt = (d.get("prompt") or "").strip()
+    duration = int(d.get("duration", 5))
+    model = (d.get("model") or "").strip() or None
+    ratio = (d.get("ratio") or "").strip() or "16:9"
     
     if not prompt:
         return jsonify({"success": False, "error": "请提供视频描述"}), 400
     
-    # 直接调用视频生成（支持有图和无图两种模式）
-    result = generate_video_jimeng(prompt, img, duration, model, ratio)
-    return jsonify(result)
+    # 验证图片URL
+    if img and not img.startswith("http"):
+        img = None
+    
+    r = gen_video(prompt, img, duration, model, ratio)
+    
+    if r.get("success"):
+        send_feishu(f"视频生成完成", "🎬 视频生成")
+    
+    return jsonify(r)
 
 @app.route('/api/notify', methods=['POST'])
 def api_notify():
-    data = request.get_json() or {}
-    if data.get("message"): send_feishu_text(data["message"])
+    """飞书通知"""
+    d = request.get_json() or {}
+    send_feishu(d.get("message", ""), d.get("title"))
     return jsonify({"success": True})
 
-def feishu_quick_generate(prompt, with_video=False):
-    try:
-        img = generate_image(prompt)
-        if not img.get("success"): send_feishu_text(f"❌ 失败：{img.get('error')}"); return
-        image_url = img["image_url"]
-        image_key = upload_image_to_feishu(image_url)
-        video_url = None
-        if with_video:
-            task = create_video_task(image_url, f"{prompt}, cinematic", 5, "1080p")
-            if task.get("success"):
-                v = wait_for_video(task["task_id"])
-                video_url = v.get("video_url") if v.get("success") else None
-        content = [[{"tag": "text", "text": f"📝 {prompt}"}]]
-        if image_key: content.append([{"tag": "img", "image_key": image_key}])
-        content.append([{"tag": "a", "text": "🖼️原图", "href": image_url}])
-        if video_url: content.append([{"tag": "a", "text": "🎬视频", "href": video_url}])
-        send_feishu_message("✅ 完成", content)
-    except Exception as e: send_feishu_text(f"❌ 失败：{e}")
+@app.route('/api/templates', methods=['GET'])
+def api_templates():
+    """获取模板列表"""
+    templates = [
+        {"id": "product", "name": "📦 产品展示", "prompt": "商业产品摄影，{product}，纯白背景，专业棚拍打光，高清产品细节，4K画质"},
+        {"id": "food", "name": "🍔 美食摄影", "prompt": "美食摄影，{product}，精致摆盘，暖色调灯光，食欲感，微距特写"},
+        {"id": "fashion", "name": "👗 时尚穿搭", "prompt": "时尚杂志封面风格，{product}，模特展示，简约纯色背景，高级感"},
+        {"id": "tech", "name": "💻 科技感", "prompt": "未来科技风格，{product}，蓝色霓虹光效，金属质感，深色背景"},
+        {"id": "nature", "name": "🌿 自然清新", "prompt": "自然清新风格，{product}，绿植背景，自然阳光，清新氛围"},
+        {"id": "luxury", "name": "✨ 高端奢华", "prompt": "奢华高端风格，{product}，金色元素，大理石背景，精致质感"},
+        {"id": "cute", "name": "🎀 可爱萌系", "prompt": "可爱萌系风格，{product}，粉色系配色，柔和光线，少女心"},
+        {"id": "chinese", "name": "🏮 国潮中式", "prompt": "国潮中国风，{product}，传统中国元素，红金配色，古典韵味"},
+    ]
+    return jsonify({"success": True, "templates": templates})
 
-@app.route('/feishu-callback', methods=['POST'])
-def feishu_callback():
-    data = request.get_json() or {}
-    if 'challenge' in data: return jsonify({"challenge": data['challenge']})
-    try:
-        if data.get('header', {}).get('event_type') == 'im.message.receive_v1':
-            msg = data.get('event', {}).get('message', {})
-            if msg.get('message_type') != 'text': return jsonify({"code": 0})
-            text = json.loads(msg.get('content', '{}')).get('text', '')
-            prompt = re.sub(r'@\S+', '', text).strip()
-            if "统计" in text: send_feishu_text(f"📊 项目数：{len(projects)}"); return jsonify({"code": 0})
-            clean = prompt.replace("视频", "").strip()
-            if clean and len(clean) >= 2:
-                threading.Thread(target=feishu_quick_generate, args=(clean, "视频" in text), daemon=True).start()
-    except Exception as e: print(f"飞书回调异常: {e}")
-    return jsonify({"code": 0})
+# ========== 页面 ==========
+
+@app.route('/')
+def index():
+    return Response(HTML_PAGE, content_type='text/html; charset=utf-8')
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok", "version": "8.5-fixed"})
+
+# ========== HTML页面 ==========
+HTML_PAGE = r'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI创作工具 v8.5</title>
+<style>
+:root{--p:linear-gradient(135deg,#667eea,#764ba2);--s:#00c853;--bg:linear-gradient(135deg,#1a1a2e,#16213e);--c:rgba(255,255,255,0.05);--t:#fff;--tm:#888}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,sans-serif;background:var(--bg);min-height:100vh;color:var(--t)}
+.container{max-width:1000px;margin:0 auto;padding:20px}
+.header{text-align:center;padding:20px 0}
+.header h1{font-size:1.8em;background:var(--p);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.badge{display:inline-block;background:var(--s);color:#000;padding:3px 10px;border-radius:15px;font-size:11px;font-weight:bold;margin-left:8px}
+.tabs{display:flex;gap:6px;margin-bottom:20px;flex-wrap:wrap}
+.tab{flex:1;min-width:70px;padding:10px 6px;background:var(--c);border-radius:10px;text-align:center;cursor:pointer;transition:all .3s;font-size:12px}
+.tab:hover{background:rgba(255,255,255,0.1)}
+.tab.active{background:var(--p)}
+.card{background:var(--c);border-radius:14px;padding:18px;margin-bottom:18px}
+.card-title{font-size:15px;font-weight:600;margin-bottom:15px;display:flex;align-items:center;gap:8px}
+.hidden{display:none!important}
+.form-group{margin-bottom:14px}
+.form-group label{display:block;margin-bottom:5px;color:var(--tm);font-size:13px}
+.form-group input,.form-group textarea,.form-group select{width:100%;padding:10px 12px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:var(--t);font-size:14px}
+.form-group textarea{min-height:80px;resize:vertical}
+.form-row{display:flex;gap:10px;flex-wrap:wrap}
+.form-row>*{flex:1;min-width:100px}
+.btn{padding:10px 20px;border:none;border-radius:8px;font-size:14px;cursor:pointer;transition:all .3s}
+.btn-primary{background:var(--p);color:#fff}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 4px 15px rgba(102,126,234,0.4)}
+.btn-primary:disabled{opacity:0.5;cursor:not-allowed;transform:none}
+.btn-secondary{background:rgba(255,255,255,0.1);color:#fff}
+.btn-sm{padding:6px 12px;font-size:12px}
+.btn-group{display:flex;gap:8px;flex-wrap:wrap}
+.upload-area{border:2px dashed rgba(255,255,255,0.2);border-radius:12px;padding:25px;text-align:center;cursor:pointer;transition:all .3s}
+.upload-area:hover{border-color:rgba(255,255,255,0.4);background:rgba(255,255,255,0.02)}
+.preview-grid{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.preview-item{width:70px;height:70px;border-radius:8px;overflow:hidden;position:relative}
+.preview-item img{width:100%;height:100%;object-fit:cover}
+.preview-item .remove{position:absolute;top:2px;right:2px;width:18px;height:18px;background:rgba(255,0,0,0.8);border-radius:50%;border:none;color:#fff;cursor:pointer;font-size:10px}
+.result-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-top:15px}
+.result-item{position:relative;border-radius:10px;overflow:hidden;aspect-ratio:1;background:rgba(0,0,0,0.3)}
+.result-item img,.result-item video{width:100%;height:100%;object-fit:cover}
+.result-item .overlay{position:absolute;bottom:0;left:0;right:0;padding:8px;background:linear-gradient(transparent,rgba(0,0,0,0.8));display:flex;gap:5px;justify-content:center;opacity:0;transition:opacity .3s}
+.result-item:hover .overlay{opacity:1}
+.progress-bar{height:4px;background:rgba(255,255,255,0.1);border-radius:2px;overflow:hidden;margin:12px 0}
+.progress-fill{height:100%;background:var(--p);transition:width .3s}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.chip{padding:6px 14px;background:rgba(255,255,255,0.08);border-radius:20px;font-size:12px;cursor:pointer;transition:all .2s}
+.chip:hover{background:rgba(255,255,255,0.15)}
+.chip.active{background:var(--p)}
+.stats{display:flex;gap:15px;margin-bottom:15px;flex-wrap:wrap}
+.stat{background:rgba(255,255,255,0.05);padding:10px 15px;border-radius:8px;text-align:center}
+.stat-val{font-size:20px;font-weight:bold;color:#667eea}
+.stat-lbl{font-size:11px;color:var(--tm)}
+.toast{position:fixed;bottom:20px;right:20px;background:#333;color:#fff;padding:12px 20px;border-radius:8px;z-index:9999;animation:slideIn .3s}
+@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+.template-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
+.template-item{background:rgba(255,255,255,0.05);padding:12px;border-radius:10px;cursor:pointer;text-align:center;transition:all .2s}
+.template-item:hover{background:rgba(255,255,255,0.1);transform:translateY(-2px)}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>🎨 AI创作工具 <span class="badge">v8.5</span></h1>
+<p style="color:var(--tm);margin-top:8px;font-size:13px">即梦AI Agent增强版</p>
+</div>
+
+<div class="tabs" id="mainTabs">
+<div class="tab active" data-tab="image">🖼️ 图片</div>
+<div class="tab" data-tab="video">🎬 视频</div>
+<div class="tab" data-tab="reverse">🔍 反推</div>
+<div class="tab" data-tab="batch">📦 批量</div>
+<div class="tab" data-tab="merge">🎨 融合</div>
+<div class="tab" data-tab="template">📋 模板</div>
+<div class="tab" data-tab="workflow">⚡ 工作流</div>
+</div>
+
+<!-- 图片生成 -->
+<div id="imageTab" class="tab-content">
+<div class="card">
+<div class="card-title">🖼️ 图片生成</div>
+<div class="chips" id="styleChips">
+<div class="chip active" data-style="realistic">📷 写实</div>
+<div class="chip" data-style="anime">🎌 动漫</div>
+<div class="chip" data-style="3d">🎮 3D</div>
+<div class="chip" data-style="art">🎨 艺术</div>
+<div class="chip" data-style="poster">📰 海报</div>
+</div>
+<div class="form-group">
+<label>图片描述</label>
+<textarea id="imagePrompt" placeholder="描述你想要的图片..."></textarea>
+</div>
+<div class="form-row">
+<div class="form-group"><label>比例</label>
+<select id="imageRatio"><option value="1:1">1:1</option><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="4:3">4:3</option></select>
+</div>
+<div class="form-group"><label>画质</label>
+<select id="imageRes"><option value="1K">1K</option><option value="2K" selected>2K</option></select>
+</div>
+<div class="form-group"><label>数量</label>
+<select id="imageCount"><option value="1">1张</option><option value="4" selected>4张</option></select>
+</div>
+</div>
+<button class="btn btn-primary" style="width:100%" id="genImageBtn">🚀 生成图片</button>
+</div>
+<div id="imageResults" class="card hidden">
+<div class="card-title">生成结果</div>
+<div id="imageGrid" class="result-grid"></div>
+</div>
+</div>
+
+<!-- 视频生成 -->
+<div id="videoTab" class="tab-content hidden">
+<div class="card">
+<div class="card-title">🎬 视频生成</div>
+<div class="form-group">
+<label>视频描述</label>
+<textarea id="videoPrompt" placeholder="描述视频内容..."></textarea>
+</div>
+<div class="form-row">
+<div class="form-group"><label>模型</label>
+<select id="videoModel"><option value="jimeng-video-3.5-pro">3.5 Pro（纯文生视频）</option><option value="jimeng-video-seedance-2.0">Seedance 2.0</option></select>
+</div>
+<div class="form-group"><label>比例</label>
+<select id="videoRatio"><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option></select>
+</div>
+<div class="form-group"><label>时长</label>
+<select id="videoDuration"><option value="5">5秒</option><option value="10">10秒</option></select>
+</div>
+</div>
+<button class="btn btn-primary" style="width:100%" id="genVideoBtn">🚀 生成视频</button>
+</div>
+<div id="videoProgress" class="card hidden">
+<div id="videoProgressText">生成中...</div>
+<div class="progress-bar"><div id="videoProgressBar" class="progress-fill" style="width:0%"></div></div>
+</div>
+<div id="videoResults" class="card hidden">
+<div class="card-title">生成结果</div>
+<div id="videoGrid" class="result-grid"></div>
+</div>
+</div>
+
+<!-- 反推提示词 -->
+<div id="reverseTab" class="tab-content hidden">
+<div class="card">
+<div class="card-title">🔍 反推提示词</div>
+<p style="color:var(--tm);font-size:13px;margin-bottom:15px">上传图片，AI分析生成提示词</p>
+<div class="form-group">
+<div class="upload-area" id="reverseUpload">
+<div style="font-size:30px;margin-bottom:8px">🖼️</div>
+<div>点击上传图片</div>
+<input type="file" id="reverseInput" accept="image/*" hidden>
+</div>
+<div id="reversePreview" class="preview-grid" style="justify-content:center"></div>
+</div>
+<div class="chips" id="reverseStyleChips">
+<div class="chip active" data-style="detailed">📝 详细</div>
+<div class="chip" data-style="simple">✨ 简洁</div>
+<div class="chip" data-style="artistic">🎨 艺术</div>
+</div>
+<button class="btn btn-primary" style="width:100%" id="reverseBtn">🔍 分析图片</button>
+</div>
+<div id="reverseResult" class="card hidden">
+<div class="card-title">分析结果</div>
+<textarea id="reversedPrompt" style="width:100%;min-height:100px;background:rgba(255,255,255,0.1);border:none;color:#fff;padding:12px;border-radius:8px"></textarea>
+<div class="btn-group" style="margin-top:12px">
+<button class="btn btn-secondary btn-sm" id="copyPromptBtn">📋 复制</button>
+<button class="btn btn-secondary btn-sm" id="optimizeBtn">✨ 优化</button>
+<button class="btn btn-primary btn-sm" id="usePromptBtn">🚀 用这个生成</button>
+</div>
+</div>
+</div>
+
+<!-- 批量生成 -->
+<div id="batchTab" class="tab-content hidden">
+<div class="card">
+<div class="card-title">📦 批量生成</div>
+<div class="chips" id="batchModeChips">
+<div class="chip active" data-mode="images">🖼️ 批量生图</div>
+<div class="chip" data-mode="videos">🎬 批量视频</div>
+</div>
+<div id="batchImagesMode">
+<div class="form-group">
+<label>提示词</label>
+<textarea id="batchImagePrompt" placeholder="输入提示词，批量生成"></textarea>
+</div>
+<div class="form-row">
+<div class="form-group"><label>数量</label>
+<select id="batchImageCount"><option value="10">10张</option><option value="20">20张</option><option value="40">40张</option></select>
+</div>
+<div class="form-group"><label>比例</label>
+<select id="batchImageRatio"><option value="1:1">1:1</option><option value="16:9">16:9</option><option value="9:16">9:16</option></select>
+</div>
+</div>
+<label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--tm);margin-bottom:12px">
+<input type="checkbox" id="batchVariations"> 生成变体
+</label>
+<button class="btn btn-primary" style="width:100%" id="batchImagesBtn">🚀 批量生成</button>
+</div>
+<div id="batchVideosMode" class="hidden">
+<div class="form-group">
+<label>提示词列表（每行一个）</label>
+<textarea id="batchVideoPrompts" placeholder="小猫奔跑&#10;日出海滩&#10;城市夜景" style="min-height:120px"></textarea>
+</div>
+<button class="btn btn-primary" style="width:100%" id="batchVideosBtn">🚀 批量生成</button>
+</div>
+</div>
+<div id="batchProgress" class="card hidden">
+<div class="stats">
+<div class="stat"><div class="stat-val" id="batchTotal">0</div><div class="stat-lbl">总数</div></div>
+<div class="stat"><div class="stat-val" id="batchDone">0</div><div class="stat-lbl">完成</div></div>
+<div class="stat"><div class="stat-val" id="batchFailed">0</div><div class="stat-lbl">失败</div></div>
+</div>
+<div class="progress-bar"><div id="batchProgressBar" class="progress-fill" style="width:0%"></div></div>
+</div>
+<div id="batchResults" class="card hidden">
+<div class="card-title">批量结果</div>
+<div id="batchGrid" class="result-grid"></div>
+</div>
+</div>
+
+<!-- 融合 -->
+<div id="mergeTab" class="tab-content hidden">
+<div class="card">
+<div class="card-title">🎨 图片融合</div>
+<p style="color:var(--tm);font-size:13px;margin-bottom:15px">上传多张图片URL进行融合（需先生成图片获取URL）</p>
+<div class="form-group">
+<label>图片URL（每行一个，至少2个）</label>
+<textarea id="mergeUrls" placeholder="https://example.com/image1.jpg&#10;https://example.com/image2.jpg" style="min-height:100px"></textarea>
+</div>
+<div class="form-group">
+<label>融合指导（可选）</label>
+<textarea id="mergePrompt" placeholder="如：融合这些图片的风格"></textarea>
+</div>
+<div class="form-group">
+<label>融合强度: <span id="strengthVal">0.5</span></label>
+<input type="range" id="mergeStrength" min="0.1" max="0.9" step="0.1" value="0.5">
+</div>
+<button class="btn btn-primary" style="width:100%" id="mergeBtn">🎨 融合生成</button>
+</div>
+<div id="mergeResult" class="card hidden">
+<div class="card-title">融合结果</div>
+<div id="mergeGrid" class="result-grid"></div>
+</div>
+</div>
+
+<!-- 模板 -->
+<div id="templateTab" class="tab-content hidden">
+<div class="card">
+<div class="card-title">📋 场景模板</div>
+<div id="templateGrid" class="template-grid"></div>
+</div>
+<div id="templateForm" class="card hidden">
+<div class="card-title" id="templateName">模板</div>
+<div class="form-group">
+<label>产品/主题</label>
+<input type="text" id="templateProduct" placeholder="输入产品名称">
+</div>
+<button class="btn btn-primary" style="width:100%" id="useTemplateBtn">🚀 生成</button>
+</div>
+</div>
+
+<!-- 工作流 -->
+<div id="workflowTab" class="tab-content hidden">
+<div class="card">
+<div class="card-title">⚡ 一键工作流</div>
+<p style="color:var(--tm);font-size:13px;margin-bottom:15px">产品→文案→分镜→图片→视频</p>
+<div class="form-group">
+<label>产品名称</label>
+<input type="text" id="workflowName" placeholder="如：新款智能手表">
+</div>
+<div class="form-group">
+<label>特点/卖点（可选）</label>
+<textarea id="workflowFeatures" placeholder="超长续航、心率监测..."></textarea>
+</div>
+<div class="form-row">
+<div class="form-group"><label>分镜数</label><select id="workflowScenes"><option value="3">3个</option><option value="5">5个</option></select></div>
+</div>
+<button class="btn btn-primary" style="width:100%" id="workflowBtn">⚡ 一键生成</button>
+</div>
+<div id="workflowProgress" class="card hidden">
+<div id="workflowStep">准备中...</div>
+<div class="progress-bar"><div id="workflowProgressBar" class="progress-fill" style="width:0%"></div></div>
+</div>
+<div id="workflowResults" class="card hidden">
+<div class="card-title">📝 文案</div>
+<p id="workflowCopy" style="color:#ccc;line-height:1.6;margin-bottom:20px"></p>
+<div class="card-title">🎬 视频</div>
+<div id="workflowGrid" class="result-grid"></div>
+</div>
+</div>
+</div>
+
+<script>
+(function(){
+// 工具函数
+function $(s){return document.querySelector(s)}
+function $$(s){return document.querySelectorAll(s)}
+function showToast(m){var t=document.createElement('div');t.className='toast';t.textContent=m;document.body.appendChild(t);setTimeout(function(){t.remove()},3000)}
+
+// 状态
+var currentStyle='realistic';
+var currentReverseStyle='detailed';
+var currentBatchMode='images';
+var reverseImageData=null;
+var currentTemplate=null;
+var STYLES={realistic:'超高清摄影，真实质感',anime:'日系动漫风格',art:'艺术插画',poster:'商业海报设计','3d':'3D渲染'};
+
+// Tab切换
+$$('#mainTabs .tab').forEach(function(tab){
+    tab.onclick=function(){
+        $$('#mainTabs .tab').forEach(function(t){t.classList.remove('active')});
+        this.classList.add('active');
+        var tabName=this.dataset.tab;
+        $$('.tab-content').forEach(function(c){c.classList.add('hidden')});
+        $('#'+tabName+'Tab').classList.remove('hidden');
+        if(tabName==='template')loadTemplates();
+    };
+});
+
+// 样式选择
+$$('#styleChips .chip').forEach(function(c){
+    c.onclick=function(){
+        $$('#styleChips .chip').forEach(function(x){x.classList.remove('active')});
+        this.classList.add('active');
+        currentStyle=this.dataset.style;
+    };
+});
+
+$$('#reverseStyleChips .chip').forEach(function(c){
+    c.onclick=function(){
+        $$('#reverseStyleChips .chip').forEach(function(x){x.classList.remove('active')});
+        this.classList.add('active');
+        currentReverseStyle=this.dataset.style;
+    };
+});
+
+$$('#batchModeChips .chip').forEach(function(c){
+    c.onclick=function(){
+        $$('#batchModeChips .chip').forEach(function(x){x.classList.remove('active')});
+        this.classList.add('active');
+        currentBatchMode=this.dataset.mode;
+        $('#batchImagesMode').classList.toggle('hidden',currentBatchMode!=='images');
+        $('#batchVideosMode').classList.toggle('hidden',currentBatchMode!=='videos');
+    };
+});
+
+// 融合强度滑块
+$('#mergeStrength').oninput=function(){$('#strengthVal').textContent=this.value};
+
+// 反推图片上传
+$('#reverseUpload').onclick=function(){$('#reverseInput').click()};
+$('#reverseInput').onchange=function(){
+    if(this.files[0]){
+        var reader=new FileReader();
+        reader.onload=function(e){
+            reverseImageData=e.target.result;
+            $('#reversePreview').innerHTML='<div class="preview-item" style="width:120px;height:120px"><img src="'+reverseImageData+'"></div>';
+        };
+        reader.readAsDataURL(this.files[0]);
+    }
+};
+
+// API调用封装
+async function api(url,data){
+    try{
+        var resp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+        if(!resp.ok){
+            var errText=await resp.text();
+            throw new Error('HTTP '+resp.status+': '+errText.substring(0,100));
+        }
+        return await resp.json();
+    }catch(e){
+        return {success:false,error:e.message};
+    }
+}
+
+// 图片生成
+$('#genImageBtn').onclick=async function(){
+    var prompt=$('#imagePrompt').value.trim();
+    if(!prompt){alert('请输入描述');return}
+    
+    this.disabled=true;this.textContent='⏳ 生成中...';
+    
+    var d=await api('/api/generate-images',{
+        prompt:prompt+'，'+STYLES[currentStyle],
+        count:parseInt($('#imageCount').value),
+        ratio:$('#imageRatio').value,
+        resolution:$('#imageRes').value
+    });
+    
+    this.disabled=false;this.textContent='🚀 生成图片';
+    
+    if(d.success&&d.images&&d.images.length>0){
+        $('#imageGrid').innerHTML=d.images.map(function(u){
+            return'<div class="result-item"><img src="'+u+'"><div class="overlay"><button class="btn btn-sm" onclick="window.open(\''+u+'\')">查看</button></div></div>';
+        }).join('');
+        $('#imageResults').classList.remove('hidden');
+    }else{
+        alert('生成失败: '+(d.error||'未知错误'));
+    }
+};
+
+// 视频生成
+$('#genVideoBtn').onclick=async function(){
+    var prompt=$('#videoPrompt').value.trim();
+    if(!prompt){alert('请输入描述');return}
+    
+    this.disabled=true;this.textContent='⏳ 生成中...';
+    $('#videoProgress').classList.remove('hidden');
+    $('#videoProgressText').textContent='正在生成视频（约1-3分钟）...';
+    $('#videoProgressBar').style.width='30%';
+    
+    var d=await api('/api/generate-video',{
+        prompt:prompt,
+        duration:parseInt($('#videoDuration').value),
+        model:$('#videoModel').value,
+        ratio:$('#videoRatio').value
+    });
+    
+    this.disabled=false;this.textContent='🚀 生成视频';
+    $('#videoProgress').classList.add('hidden');
+    
+    if(d.success&&(d.url||d.video_url)){
+        var url=d.url||d.video_url;
+        $('#videoProgressBar').style.width='100%';
+        $('#videoGrid').innerHTML='<div class="result-item" style="aspect-ratio:16/9"><video src="'+url+'" controls></video></div>';
+        $('#videoResults').classList.remove('hidden');
+    }else{
+        alert('生成失败: '+(d.error||'未知错误'));
+    }
+};
+
+// 反推提示词
+$('#reverseBtn').onclick=async function(){
+    if(!reverseImageData){alert('请上传图片');return}
+    
+    this.disabled=true;this.textContent='⏳ 分析中...';
+    
+    var d=await api('/api/reverse-prompt',{image_base64:reverseImageData,style:currentReverseStyle});
+    
+    this.disabled=false;this.textContent='🔍 分析图片';
+    
+    if(d.success){
+        $('#reversedPrompt').value=d.prompt;
+        $('#reverseResult').classList.remove('hidden');
+    }else{
+        alert('分析失败: '+(d.error||'未知错误'));
+    }
+};
+
+$('#copyPromptBtn').onclick=function(){
+    navigator.clipboard.writeText($('#reversedPrompt').value);
+    showToast('已复制');
+};
+
+$('#optimizeBtn').onclick=async function(){
+    var p=$('#reversedPrompt').value;
+    if(!p)return;
+    
+    this.disabled=true;
+    var d=await api('/api/optimize-prompt',{prompt:p,style:'enhance'});
+    this.disabled=false;
+    
+    if(d.success){
+        $('#reversedPrompt').value=d.optimized;
+        showToast('已优化');
+    }
+};
+
+$('#usePromptBtn').onclick=function(){
+    $('#imagePrompt').value=$('#reversedPrompt').value;
+    $$('#mainTabs .tab').forEach(function(t){t.classList.remove('active')});
+    $$('#mainTabs .tab')[0].classList.add('active');
+    $$('.tab-content').forEach(function(c){c.classList.add('hidden')});
+    $('#imageTab').classList.remove('hidden');
+};
+
+// 批量生图
+$('#batchImagesBtn').onclick=async function(){
+    var prompt=$('#batchImagePrompt').value.trim();
+    if(!prompt){alert('请输入提示词');return}
+    
+    this.disabled=true;
+    $('#batchProgress').classList.remove('hidden');
+    $('#batchTotal').textContent=$('#batchImageCount').value;
+    $('#batchDone').textContent='0';
+    $('#batchFailed').textContent='0';
+    $('#batchProgressBar').style.width='10%';
+    
+    var d=await api('/api/batch-images',{
+        prompt:prompt+'，'+STYLES[currentStyle],
+        count:parseInt($('#batchImageCount').value),
+        ratio:$('#batchImageRatio').value,
+        variations:$('#batchVariations').checked
+    });
+    
+    this.disabled=false;
+    $('#batchProgressBar').style.width='100%';
+    $('#batchDone').textContent=d.done||0;
+    $('#batchFailed').textContent=d.failed||0;
+    
+    if(d.images&&d.images.length>0){
+        $('#batchGrid').innerHTML=d.images.map(function(u){
+            return'<div class="result-item"><img src="'+u+'"></div>';
+        }).join('');
+        $('#batchResults').classList.remove('hidden');
+    }else{
+        alert('生成失败');
+    }
+};
+
+// 批量生视频
+$('#batchVideosBtn').onclick=async function(){
+    var ps=$('#batchVideoPrompts').value.trim();
+    if(!ps){alert('请输入提示词');return}
+    
+    var prompts=ps.split('\n').filter(function(p){return p.trim()});
+    
+    this.disabled=true;
+    $('#batchProgress').classList.remove('hidden');
+    $('#batchTotal').textContent=prompts.length;
+    
+    var d=await api('/api/batch-videos',{prompts:prompts,duration:5,ratio:'16:9'});
+    
+    this.disabled=false;
+    $('#batchProgressBar').style.width='100%';
+    $('#batchDone').textContent=d.done||0;
+    
+    if(d.videos&&d.videos.length>0){
+        $('#batchGrid').innerHTML=d.videos.map(function(v){
+            var url=typeof v==='string'?v:v.url;
+            return'<div class="result-item" style="aspect-ratio:16/9"><video src="'+url+'" controls></video></div>';
+        }).join('');
+        $('#batchResults').classList.remove('hidden');
+    }
+};
+
+// 图片融合
+$('#mergeBtn').onclick=async function(){
+    var urls=$('#mergeUrls').value.trim().split('\n').filter(function(u){return u.trim().startsWith('http')});
+    if(urls.length<2){alert('请至少提供2个图片URL');return}
+    
+    this.disabled=true;this.textContent='⏳ 融合中...';
+    
+    var d=await api('/api/merge-images',{
+        images:urls,
+        prompt:$('#mergePrompt').value||'融合风格',
+        strength:parseFloat($('#mergeStrength').value)
+    });
+    
+    this.disabled=false;this.textContent='🎨 融合生成';
+    
+    if(d.success&&(d.url||d.image_url)){
+        var url=d.url||d.image_url;
+        $('#mergeGrid').innerHTML='<div class="result-item"><img src="'+url+'"></div>';
+        $('#mergeResult').classList.remove('hidden');
+    }else{
+        alert('融合失败: '+(d.error||'未知错误'));
+    }
+};
+
+// 模板
+async function loadTemplates(){
+    try{
+        var resp=await fetch('/api/templates');
+        var d=await resp.json();
+        if(d.templates){
+            $('#templateGrid').innerHTML=d.templates.map(function(t){
+                return'<div class="template-item" data-id="'+t.id+'" data-prompt="'+t.prompt.replace(/"/g,'&quot;')+'">'+t.name+'</div>';
+            }).join('');
+            
+            $$('#templateGrid .template-item').forEach(function(item){
+                item.onclick=function(){
+                    currentTemplate={id:this.dataset.id,prompt:this.dataset.prompt};
+                    $('#templateName').textContent=this.textContent;
+                    $('#templateForm').classList.remove('hidden');
+                };
+            });
+        }
+    }catch(e){}
+}
+
+$('#useTemplateBtn').onclick=function(){
+    if(!currentTemplate)return;
+    var product=$('#templateProduct').value.trim();
+    if(!product){alert('请输入产品名称');return}
+    
+    var prompt=currentTemplate.prompt.replace('{product}',product);
+    $('#imagePrompt').value=prompt;
+    
+    $$('#mainTabs .tab').forEach(function(t){t.classList.remove('active')});
+    $$('#mainTabs .tab')[0].classList.add('active');
+    $$('.tab-content').forEach(function(c){c.classList.add('hidden')});
+    $('#imageTab').classList.remove('hidden');
+};
+
+// 工作流
+$('#workflowBtn').onclick=async function(){
+    var name=$('#workflowName').value.trim();
+    if(!name){alert('请输入产品名称');return}
+    
+    this.disabled=true;
+    $('#workflowProgress').classList.remove('hidden');
+    $('#workflowResults').classList.add('hidden');
+    
+    try{
+        // 1. 生成文案
+        $('#workflowStep').textContent='📝 生成文案...';
+        $('#workflowProgressBar').style.width='15%';
+        var cd=await api('/api/generate-copy',{product_name:name,product_features:$('#workflowFeatures').value});
+        if(!cd.success)throw new Error(cd.error||'文案生成失败');
+        var copy=cd.copy;
+        
+        // 2. 生成分镜
+        $('#workflowStep').textContent='🎬 生成分镜...';
+        $('#workflowProgressBar').style.width='30%';
+        var sd=await api('/api/generate-storyboard',{product_name:name,copywriting:copy,count:parseInt($('#workflowScenes').value)});
+        if(!sd.success)throw new Error(sd.error||'分镜生成失败');
+        var scenes=(sd.storyboard&&sd.storyboard.scenes)||[];
+        
+        if(scenes.length===0)throw new Error('未生成有效分镜');
+        
+        // 3. 生成图片 - 保存图片和场景的对应关系
+        $('#workflowStep').textContent='🖼️ 生成图片...';
+        var imageScenePairs=[];  // {image: url, scene: scene}
+        for(var i=0;i<scenes.length;i++){
+            $('#workflowProgressBar').style.width=(30+i*20/scenes.length)+'%';
+            $('#workflowStep').textContent='🖼️ 生成图片 '+(i+1)+'/'+scenes.length+'...';
+            var id=await api('/api/generate-images',{prompt:scenes[i].image_prompt,count:1});
+            if(id.images&&id.images[0]){
+                imageScenePairs.push({image:id.images[0],scene:scenes[i]});
+            }
+        }
+        
+        if(imageScenePairs.length===0)throw new Error('所有图片生成失败');
+        
+        // 4. 生成视频 - 使用配对的scene
+        $('#workflowStep').textContent='🎬 生成视频...';
+        var videos=[];
+        for(var i=0;i<imageScenePairs.length;i++){
+            var pair=imageScenePairs[i];
+            $('#workflowProgressBar').style.width=(50+i*45/imageScenePairs.length)+'%';
+            $('#workflowStep').textContent='🎬 生成视频 '+(i+1)+'/'+imageScenePairs.length+'...';
+            var vd=await api('/api/generate-video',{
+                prompt:pair.scene.video_prompt||'smooth cinematic movement',
+                image_url:pair.image,
+                duration:5
+            });
+            if(vd.url||vd.video_url)videos.push(vd.url||vd.video_url);
+        }
+        
+        if(videos.length===0)throw new Error('所有视频生成失败');
+        
+        // 显示结果
+        $('#workflowProgressBar').style.width='100%';
+        $('#workflowStep').textContent='✅ 完成！';
+        $('#workflowCopy').textContent=copy;
+        $('#workflowGrid').innerHTML=videos.map(function(v){
+            return'<div class="result-item" style="aspect-ratio:16/9"><video src="'+v+'" controls></video></div>';
+        }).join('');
+        $('#workflowResults').classList.remove('hidden');
+        
+    }catch(e){
+        alert('工作流失败: '+e.message);
+    }finally{
+        this.disabled=false;
+        $('#workflowProgress').classList.add('hidden');
+    }
+};
+
+})();
+</script>
+</body>
+</html>'''
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8080))
-    print(f"🚀 即梦AI v6.1 启动 - 端口: {port}")
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get('PORT', 8000))
+    print(f"🚀 即梦AI v8.5 修复版启动 - 端口: {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)

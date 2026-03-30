@@ -1,5 +1,7 @@
-# Gunicorn配置
-bind = "0.0.0.0:8080"
+bind = "0.0.0.0:8000"
 workers = 2
-timeout = 600  # 10分钟超时
+timeout = 600
 keepalive = 5
+errorlog = "-"
+accesslog = "-"
+loglevel = "info"
