@@ -103,9 +103,10 @@ def gen_image(prompt, ratio="1:1", resolution="2k", ref_images=None, strength=0.
         print(f"[图片] {prompt[:40]}... 比例:{ratio} 分辨率:{resolution} 模型:{payload['model']}", flush=True)
         resp = requests.post(f"{JIMENG_FREE_API}/v1/images/generations", headers=headers, json=payload, timeout=180)
         if resp.status_code != 200: return {"success":False,"error":f"HTTP {resp.status_code}: {resp.text[:100]}"}
-        data = resp.json().get("data") or []
+        result = resp.json()
+        data = result.get("data") or []
         if data: return {"success":True,"url":data[0].get("url",""),"image_url":data[0].get("url","")}
-        return {"success":False,"error":resp.json().get("message") or str(resp.json())}
+        return {"success":False,"error":result.get("message") or result.get("error",{}).get("message") or str(result)[:200]}
     except requests.exceptions.Timeout: return {"success":False,"error":"图片生成超时(180秒)"}
     except Exception as e: return {"success":False,"error":str(e)}
 
@@ -126,12 +127,13 @@ def gen_video(prompt, image_url=None, duration=5, model=None, ratio="16:9"):
         resp = requests.post(f"{JIMENG_FREE_API}/v1/videos/generations", headers=headers, json=payload, timeout=600)
         print(f"[视频API] 状态码:{resp.status_code} 响应:{resp.text[:200]}", flush=True)
         if resp.status_code != 200: return {"success":False,"error":f"HTTP {resp.status_code}: {resp.text[:100]}"}
-        data = resp.json().get("data") or []
+        result = resp.json()
+        data = result.get("data") or []
         if data:
             url = data[0].get("url","")
             print(f"[视频成功] URL: {url[:80]}", flush=True)
             return {"success":True,"url":url,"video_url":url}
-        return {"success":False,"error":resp.json().get("message") or str(resp.json())}
+        return {"success":False,"error":result.get("message") or result.get("error",{}).get("message") or str(result)[:200]}
     except requests.exceptions.Timeout: return {"success":False,"error":"视频生成超时(600秒)"}
     except Exception as e: return {"success":False,"error":str(e)}
 
@@ -200,8 +202,9 @@ def _img2img_via_chat(prompt, ref_b64, ratio, resolution, model):
     try:
         if "," in ref_b64: ref_b64 = ref_b64.split(",")[1]
         headers = {"Content-Type":"application/json","Authorization":f"Bearer {JIMENG_SESSION_IDS}"}
+        use_model = model or JIMENG_IMAGE_MODEL
         payload = {
-            "model": model or JIMENG_IMAGE_MODEL,
+            "model": use_model,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -210,24 +213,34 @@ def _img2img_via_chat(prompt, ref_b64, ratio, resolution, model):
                 ]
             }]
         }
-        print(f"[图生图] chat接口 提示词:{prompt[:40]}... 模型:{payload['model']}", flush=True)
         resp = requests.post(f"{JIMENG_FREE_API}/v1/chat/completions", headers=headers, json=payload, timeout=180)
-        print(f"[图生图] 状态码:{resp.status_code}", flush=True)
         if resp.status_code != 200:
-            return jsonify({"success":False,"error":f"HTTP {resp.status_code}: {resp.text[:100]}"})
+            return jsonify({"success":False,"error":f"图生图HTTP {resp.status_code}: {resp.text[:200]}"})
         result = resp.json()
-        # 从chat响应中提取图片URL
         choices = result.get("choices") or []
+        urls = []
         if choices:
             content = choices[0].get("message",{}).get("content","")
-            # 提取markdown图片链接 ![](url)
-            urls = re.findall(r'!\[.*?\]\((https?://[^\)]+)\)', content)
-            if urls:
-                return jsonify({"success":True,"images":urls})
-        return jsonify({"success":False,"error":"未能从响应中提取图片"})
+            # 格式1: markdown ![xxx](url)
+            urls = re.findall(r'!\[.*?\]\((https?://[^\s\)]+)\)', content)
+            # 格式2: 纯http URL（带图片扩展名）
+            if not urls:
+                urls = re.findall(r'(https?://[^\s\"\'<>]+\.(?:png|jpg|jpeg|webp|gif)[^\s\"\'<>]*)', content)
+            # 格式3: 任何即梦CDN URL
+            if not urls:
+                urls = re.findall(r'(https?://[^\s\"\'<>]*(?:byteimg|dreamina|jimeng|heycan)[^\s\"\'<>]*)', content)
+            # 格式4: 任何https URL
+            if not urls:
+                urls = re.findall(r'(https?://[^\s\"\'<>]+)', content)
+            # 过滤非图片URL
+            urls = [u for u in urls if not u.endswith('.js') and not u.endswith('.css') and not u.endswith('.html')]
+        if urls:
+            return jsonify({"success":True,"images":urls[:4]})
+        # 调试：返回API原始内容
+        debug = content[:500] if choices else json.dumps(result, ensure_ascii=False)[:500]
+        return jsonify({"success":False,"error":f"图生图未提取到图片URL。API返回: {debug}"})
     except Exception as e:
-        print(f"[图生图异常] {e}", flush=True)
-        return jsonify({"success":False,"error":str(e)})
+        return jsonify({"success":False,"error":f"图生图异常: {str(e)}"})
 
 @app.route('/api/generate-video', methods=['POST'])
 def api_generate_video():
@@ -260,6 +273,7 @@ def _b64_to_url(b64_data, prompt="参考图"):
     try:
         if "," in b64_data: b64_data = b64_data.split(",")[1]
         headers = {"Content-Type":"application/json","Authorization":f"Bearer {JIMENG_SESSION_IDS}"}
+        # 方法1：chat接口（支持base64）
         payload = {
             "model": JIMENG_IMAGE_MODEL,
             "messages": [{
@@ -272,12 +286,18 @@ def _b64_to_url(b64_data, prompt="参考图"):
         }
         resp = requests.post(f"{JIMENG_FREE_API}/v1/chat/completions", headers=headers, json=payload, timeout=180)
         if resp.status_code == 200:
-            choices = resp.json().get("choices") or []
+            result = resp.json()
+            choices = result.get("choices") or []
             if choices:
                 content = choices[0].get("message",{}).get("content","")
-                urls = re.findall(r'!\[.*?\]\((https?://[^\)]+)\)', content)
+                # 多种格式提取
+                urls = re.findall(r'!\[.*?\]\((https?://[^\s\)]+)\)', content)
+                if not urls:
+                    urls = re.findall(r'(https?://[^\s\"\'<>]+\.(?:png|jpg|jpeg|webp)[^\s\"\'<>]*)', content)
+                if not urls:
+                    urls = re.findall(r'(https?://[^\s\"\'<>]*(?:byteimg|dreamina|jimeng|heycan)[^\s\"\'<>]*)', content)
                 if urls: return urls[0]
-        # 回退：用images/generations接口生成一张简单图片获取URL
+        # 方法2回退：images/generations生成一张图获取URL
         payload2 = {"model": JIMENG_IMAGE_MODEL, "prompt": prompt, "ratio": "1:1", "resolution": "1k"}
         resp2 = requests.post(f"{JIMENG_FREE_API}/v1/images/generations", headers=headers, json=payload2, timeout=180)
         if resp2.status_code == 200:
@@ -412,28 +432,40 @@ def api_templates():
 # ========== 视频代理 ==========
 @app.route('/api/proxy-video')
 def api_proxy_video():
-    """代理视频URL，绕过CDN防盗链/签名限制"""
+    """代理视频URL，绕过CDN防盗链/签名限制，支持Range请求"""
     url = request.args.get('url', '')
     if not url or not url.startswith('http'):
         return Response('Missing url', status=400)
     try:
-        # 用服务端请求视频，带上必要的headers
-        resp = requests.get(url, headers={
+        req_headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Referer': 'https://jimeng.jianying.com/',
             'Origin': 'https://jimeng.jianying.com'
-        }, stream=True, timeout=30)
-        if resp.status_code != 200:
+        }
+        # 透传Range请求头（支持视频seek）
+        if request.headers.get('Range'):
+            req_headers['Range'] = request.headers['Range']
+
+        resp = requests.get(url, headers=req_headers, stream=True, timeout=60)
+        if resp.status_code not in (200, 206):
             return Response(f'Upstream {resp.status_code}', status=resp.status_code)
-        # 流式返回视频
+
         def generate():
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    yield chunk
-        return Response(generate(), content_type=resp.headers.get('Content-Type', 'video/mp4'),
-            headers={'Accept-Ranges': 'bytes', 'Cache-Control': 'public, max-age=3600'})
+            for chunk in resp.iter_content(chunk_size=65536):
+                if chunk: yield chunk
+
+        resp_headers = {
+            'Content-Type': resp.headers.get('Content-Type', 'video/mp4'),
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'public, max-age=3600'
+        }
+        if resp.headers.get('Content-Length'):
+            resp_headers['Content-Length'] = resp.headers['Content-Length']
+        if resp.headers.get('Content-Range'):
+            resp_headers['Content-Range'] = resp.headers['Content-Range']
+
+        return Response(generate(), status=resp.status_code, headers=resp_headers)
     except Exception as e:
-        print(f"[视频代理错误] {e}", flush=True)
         return Response(str(e), status=500)
 
 # ========== 页面 ==========
@@ -686,7 +718,6 @@ body{font-family:-apple-system,sans-serif;background:var(--bg);min-height:100vh;
 (function(){
 var $=function(s){return document.querySelector(s)},$$=function(s){return document.querySelectorAll(s)};
 function showToast(m){var t=document.createElement('div');t.className='toast';t.textContent=m;document.body.appendChild(t);setTimeout(function(){t.remove()},3000)}
-function copyText(t){navigator.clipboard.writeText(t);showToast('已复制URL')}
 
 function safeUrl(u){return u.replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;')}
 
