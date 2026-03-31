@@ -166,13 +166,19 @@ def api_generate_images():
     pixel_size = d.get("pixel_size","")
     ratio = d.get("ratio","1:1")
     resolution = d.get("resolution","2k")
-    ref = d.get("ref_image")
+    ref = d.get("ref_image")  # URL
+    ref_b64 = d.get("ref_image_base64")  # base64
     strength = float(d.get("strength",0.5))
     img_model = d.get("model") or None
     if not prompt: return jsonify({"success":False,"error":"请提供提示词"}), 400
     if pixel_size and pixel_size in PIXEL_TO_PARAMS:
         p = PIXEL_TO_PARAMS[pixel_size]; ratio = p["ratio"]; resolution = p["resolution"]
     resolution = resolution.lower()
+
+    # 以图生图：有base64参考图时，用chat completions接口（支持base64）
+    if ref_b64:
+        return _img2img_via_chat(prompt, ref_b64, ratio, resolution, img_model)
+
     ref_imgs = [ref] if ref and isinstance(ref, str) and ref.startswith("http") else None
     images, errors = [], []
     def gen(i): return gen_image(prompt, ratio, resolution, ref_images=ref_imgs, strength=strength, model=img_model)
@@ -189,19 +195,97 @@ def api_generate_images():
     if not images: return jsonify({"success":False,"error":errors[0] if errors else "生成失败"})
     return jsonify({"success":True,"images":[x["url"] for x in images]})
 
+def _img2img_via_chat(prompt, ref_b64, ratio, resolution, model):
+    """以图生图：通过即梦chat completions接口，支持base64图片"""
+    try:
+        if "," in ref_b64: ref_b64 = ref_b64.split(",")[1]
+        headers = {"Content-Type":"application/json","Authorization":f"Bearer {JIMENG_SESSION_IDS}"}
+        payload = {
+            "model": model or JIMENG_IMAGE_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{ref_b64}"}},
+                    {"type": "text", "text": prompt}
+                ]
+            }]
+        }
+        print(f"[图生图] chat接口 提示词:{prompt[:40]}... 模型:{payload['model']}", flush=True)
+        resp = requests.post(f"{JIMENG_FREE_API}/v1/chat/completions", headers=headers, json=payload, timeout=180)
+        print(f"[图生图] 状态码:{resp.status_code}", flush=True)
+        if resp.status_code != 200:
+            return jsonify({"success":False,"error":f"HTTP {resp.status_code}: {resp.text[:100]}"})
+        result = resp.json()
+        # 从chat响应中提取图片URL
+        choices = result.get("choices") or []
+        if choices:
+            content = choices[0].get("message",{}).get("content","")
+            # 提取markdown图片链接 ![](url)
+            urls = re.findall(r'!\[.*?\]\((https?://[^\)]+)\)', content)
+            if urls:
+                return jsonify({"success":True,"images":urls})
+        return jsonify({"success":False,"error":"未能从响应中提取图片"})
+    except Exception as e:
+        print(f"[图生图异常] {e}", flush=True)
+        return jsonify({"success":False,"error":str(e)})
+
 @app.route('/api/generate-video', methods=['POST'])
 def api_generate_video():
     d = request.get_json() or {}
     img = (d.get("image_url") or "").strip() or None
+    img_b64 = d.get("image_base64") or None
     prompt = (d.get("prompt") or "").strip()
     duration = int(d.get("duration",5))
     model = (d.get("model") or "").strip() or None
     ratio = (d.get("ratio") or "").strip() or "16:9"
+
+    # 如果有base64图片，先通过即梦生成获取URL
+    if img_b64 and not img:
+        print("[视频] 有base64参考图，先生成图片获取URL...", flush=True)
+        url_result = _b64_to_url(img_b64, prompt or "参考图")
+        if url_result:
+            img = url_result
+            print(f"[视频] 获取到图片URL: {img[:60]}", flush=True)
+        else:
+            return jsonify({"success":False,"error":"参考图上传失败，无法获取URL"})
+
     if not prompt and not img: return jsonify({"success":False,"error":"请提供视频描述或参考图"}), 400
     if img and not img.startswith("http"): img = None
     r = gen_video(prompt or "smooth cinematic movement", img, duration, model, ratio)
     if r.get("success"): send_feishu("视频生成完成","🎬 视频生成")
     return jsonify(r)
+
+def _b64_to_url(b64_data, prompt="参考图"):
+    """将base64图片通过即梦生成一张图获取URL"""
+    try:
+        if "," in b64_data: b64_data = b64_data.split(",")[1]
+        headers = {"Content-Type":"application/json","Authorization":f"Bearer {JIMENG_SESSION_IDS}"}
+        payload = {
+            "model": JIMENG_IMAGE_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"}},
+                    {"type": "text", "text": f"基于这张图片，生成一张相同内容的图片。{prompt}"}
+                ]
+            }]
+        }
+        resp = requests.post(f"{JIMENG_FREE_API}/v1/chat/completions", headers=headers, json=payload, timeout=180)
+        if resp.status_code == 200:
+            choices = resp.json().get("choices") or []
+            if choices:
+                content = choices[0].get("message",{}).get("content","")
+                urls = re.findall(r'!\[.*?\]\((https?://[^\)]+)\)', content)
+                if urls: return urls[0]
+        # 回退：用images/generations接口生成一张简单图片获取URL
+        payload2 = {"model": JIMENG_IMAGE_MODEL, "prompt": prompt, "ratio": "1:1", "resolution": "1k"}
+        resp2 = requests.post(f"{JIMENG_FREE_API}/v1/images/generations", headers=headers, json=payload2, timeout=180)
+        if resp2.status_code == 200:
+            data = resp2.json().get("data") or []
+            if data: return data[0].get("url")
+    except Exception as e:
+        print(f"[b64转URL失败] {e}", flush=True)
+    return None
 
 @app.route('/api/batch-images', methods=['POST'])
 def api_batch_images():
@@ -453,9 +537,10 @@ body{font-family:-apple-system,sans-serif;background:var(--bg);min-height:100vh;
 <div class="chip" data-style="poster">📰 海报</div>
 </div>
 <div class="form-group"><label>图片描述</label><textarea id="imagePrompt" placeholder="描述你想要的图片..."></textarea></div>
-<div class="form-group"><label>参考图URL（可选，以图生图）</label>
-<input type="text" id="refImageUrl" placeholder="粘贴已有图片URL，基于此图生成新图">
-<div style="font-size:12px;color:var(--tm);margin-top:4px">💡 先生成图片，hover点📋复制URL，再粘贴到这里</div>
+<div class="upload-area" id="refUpload" onclick="document.getElementById('refInput').click()">
+📎 点击上传参考图（可选，以图生图）
+<input type="file" id="refInput" accept="image/*" hidden>
+<div id="refPreview"></div>
 </div>
 <div id="refStrengthGroup" class="form-group hidden">
 <label>参考强度: <span id="refStrengthVal">0.5</span></label>
@@ -488,8 +573,13 @@ body{font-family:-apple-system,sans-serif;background:var(--bg);min-height:100vh;
 <div class="card-title">🎬 视频生成</div>
 <div class="form-group"><label>视频描述</label><textarea id="videoPrompt" placeholder="描述视频内容..."></textarea></div>
 <div id="videoImgGroup" class="hidden">
-<div class="form-group"><label>参考图URL（Seedance必填，先在图片Tab生成后复制URL）</label>
-<input type="text" id="videoImageUrl" placeholder="粘贴图片URL"></div>
+<div class="upload-area" id="videoImgUpload" onclick="document.getElementById('videoImgInput').click()">
+📎 点击上传参考图（Seedance必填）
+<input type="file" id="videoImgInput" accept="image/*" hidden>
+<div id="videoImgPreview"></div>
+</div>
+<div class="form-group"><label>或粘贴图片URL</label>
+<input type="text" id="videoImageUrl" placeholder="也可以直接粘贴图片URL"></div>
 </div>
 <div class="form-row">
 <div class="form-group"><label>模型</label>
@@ -638,9 +728,29 @@ $$('#batchModeChips .chip').forEach(function(c){c.onclick=function(){$$('#batchM
 $('#mergeStrength').oninput=function(){$('#strengthVal').textContent=this.value};
 $('#videoModel').onchange=function(){var need=this.value.indexOf('seedance')>=0;$('#videoImgGroup').classList.toggle('hidden',!need)};
 
-// 参考图URL输入 -> 显示强度滑块
-$('#refImageUrl').oninput=function(){$('#refStrengthGroup').classList.toggle('hidden',!this.value.trim())};
+// 参考图上传（以图生图）
+var refImageB64=null;
+$('#refInput').onchange=function(){
+    if(!this.files[0])return;
+    var reader=new FileReader();reader.onload=function(e){
+        refImageB64=e.target.result;
+        $('#refPreview').innerHTML='<img src="'+e.target.result+'" style="max-height:80px;border-radius:6px;margin-top:8px">';
+        $('#refUpload').classList.add('has-image');
+        $('#refStrengthGroup').classList.remove('hidden');
+    };reader.readAsDataURL(this.files[0]);
+};
 $('#refStrength').oninput=function(){$('#refStrengthVal').textContent=this.value};
+
+// 视频参考图上传
+var videoImgB64=null;
+$('#videoImgInput').onchange=function(){
+    if(!this.files[0])return;
+    var reader=new FileReader();reader.onload=function(e){
+        videoImgB64=e.target.result;
+        $('#videoImgPreview').innerHTML='<img src="'+e.target.result+'" style="max-height:80px;border-radius:6px;margin-top:8px">';
+        $('#videoImgUpload').classList.add('has-image');
+    };reader.readAsDataURL(this.files[0]);
+};
 
 // 反推上传
 $('#reverseUpload').onclick=function(){$('#reverseInput').click()};
@@ -656,12 +766,14 @@ $('#genImageBtn').onclick=async function(){
     var pixelSize=$('#imagePixel').value;
     var payload={prompt:p+'，'+STYLES[currentStyle],count:parseInt($('#imageCount').value),
         pixel_size:pixelSize,resolution:$('#imageRes').value,model:$('#imageModel').value||undefined};
-    // 如果选了非1:1的像素尺寸，比例由像素决定；否则用手动选的比例
-    if(pixelSize==='1440x1920'){/* 3:4 由后端pixel映射决定 */}
-    else{payload.ratio=$('#imageRatio').value}
+    if(pixelSize!=='1440x1920'){payload.ratio=$('#imageRatio').value}
     
-    var ref=$('#refImageUrl').value.trim();
-    if(ref&&ref.startsWith('http')){payload.ref_image=ref;payload.strength=parseFloat($('#refStrength').value)}
+    // 以图生图：发送base64
+    if(refImageB64){
+        payload.ref_image_base64=refImageB64;
+        payload.strength=parseFloat($('#refStrength').value);
+        payload.count=1; // 图生图只生成1张
+    }
     
     var d=await api('/api/generate-images',payload);
     this.disabled=false;this.textContent='🚀 生成图片';$('#imageProgress').classList.add('hidden');
@@ -671,11 +783,16 @@ $('#genImageBtn').onclick=async function(){
 
 // === 视频生成 ===
 $('#genVideoBtn').onclick=async function(){
-    var p=$('#videoPrompt').value.trim(),m=$('#videoModel').value,img=$('#videoImageUrl')?$('#videoImageUrl').value.trim():'';
-    if(m.indexOf('seedance')>=0&&!img){alert('Seedance模型需要图片URL\n\n请先在「图片」Tab生成图片，复制URL后粘贴');return}
-    if(!p&&!img){alert('请输入视频描述');return}
+    var p=$('#videoPrompt').value.trim(),m=$('#videoModel').value;
+    var imgUrl=$('#videoImageUrl')?$('#videoImageUrl').value.trim():'';
+    var hasImg=videoImgB64||imgUrl;
+    if(m.indexOf('seedance')>=0&&!hasImg){alert('Seedance模型需要参考图\n\n请上传图片或粘贴图片URL');return}
+    if(!p&&!hasImg){alert('请输入视频描述');return}
     this.disabled=true;this.textContent='⏳ 生成中...';$('#videoProgress').classList.remove('hidden');$('#videoResults').classList.add('hidden');
-    var d=await api('/api/generate-video',{prompt:p||undefined,duration:parseInt($('#videoDuration').value),model:m,ratio:$('#videoRatio').value,image_url:img||undefined});
+    var payload={prompt:p||undefined,duration:parseInt($('#videoDuration').value),model:m,ratio:$('#videoRatio').value};
+    if(imgUrl) payload.image_url=imgUrl;
+    else if(videoImgB64) payload.image_base64=videoImgB64;
+    var d=await api('/api/generate-video',payload);
     this.disabled=false;this.textContent='🚀 生成视频';$('#videoProgress').classList.add('hidden');
     if(d.success&&(d.url||d.video_url)){var url=d.url||d.video_url;$('#videoGrid').innerHTML='';$('#videoGrid').appendChild(mkVideo(url,$('#videoRatio').value.replace(':','/')));$('#videoResults').classList.remove('hidden')}
     else alert('生成失败: '+(d.error||'未知错误'));
