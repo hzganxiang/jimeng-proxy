@@ -115,13 +115,16 @@ def gen_video(prompt, image_url=None, duration=5, model=None, ratio="16:9"):
         duration = max(4, min(duration, 15))
         if image_url:
             use_model = model or JIMENG_VIDEO_MODEL_IMAGE
-            payload = {"model":use_model,"prompt":f"@1 {prompt}" if prompt else "@1 smooth cinematic movement","ratio":ratio,"duration":duration,"file_paths":[image_url]}
+            # Seedance格式：prompt直接描述动作，file_paths传图片URL
+            payload = {"model":use_model,"prompt":prompt or "smooth cinematic movement","ratio":ratio,"duration":duration,"file_paths":[image_url]}
         else:
             use_model = model or JIMENG_VIDEO_MODEL_TEXT
             if "seedance" in (use_model or "").lower(): use_model = JIMENG_VIDEO_MODEL_TEXT
             payload = {"model":use_model,"prompt":prompt or "smooth cinematic movement","ratio":ratio,"duration":duration}
         print(f"[视频] {(prompt or 'no-prompt')[:40]}... 模型:{use_model} 比例:{ratio} 时长:{duration}s", flush=True)
+        print(f"[视频payload] {json.dumps(payload, ensure_ascii=False)[:200]}", flush=True)
         resp = requests.post(f"{JIMENG_FREE_API}/v1/videos/generations", headers=headers, json=payload, timeout=600)
+        print(f"[视频API] 状态码:{resp.status_code} 响应:{resp.text[:200]}", flush=True)
         if resp.status_code != 200: return {"success":False,"error":f"HTTP {resp.status_code}: {resp.text[:100]}"}
         data = resp.json().get("data") or []
         if data:
@@ -321,6 +324,33 @@ def api_templates():
         {"id":"cute","name":"🎀 可爱萌系","prompt":"甜美可爱少女风，{product}，粉色和薰衣草色系渐变背景，星星亮片散落装饰，柔和梦幻光晕，蝴蝶结和蕾丝元素，棉花糖般柔软质感，日系卡哇伊风格，甜蜜治愈"},
         {"id":"chinese","name":"🏮 国潮中式","prompt":"新中式国潮美学，{product}，朱红金色主色调，水墨山水意境背景，中国传统纹样（云纹/回纹）装饰，宣纸质感，古典灯笼光影，故宫配色方案，东方美学高级感，大气磅礴"},
     ]})
+
+# ========== 视频代理 ==========
+@app.route('/api/proxy-video')
+def api_proxy_video():
+    """代理视频URL，绕过CDN防盗链/签名限制"""
+    url = request.args.get('url', '')
+    if not url or not url.startswith('http'):
+        return Response('Missing url', status=400)
+    try:
+        # 用服务端请求视频，带上必要的headers
+        resp = requests.get(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://jimeng.jianying.com/',
+            'Origin': 'https://jimeng.jianying.com'
+        }, stream=True, timeout=30)
+        if resp.status_code != 200:
+            return Response(f'Upstream {resp.status_code}', status=resp.status_code)
+        # 流式返回视频
+        def generate():
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        return Response(generate(), content_type=resp.headers.get('Content-Type', 'video/mp4'),
+            headers={'Accept-Ranges': 'bytes', 'Cache-Control': 'public, max-age=3600'})
+    except Exception as e:
+        print(f"[视频代理错误] {e}", flush=True)
+        return Response(str(e), status=500)
 
 # ========== 页面 ==========
 @app.route('/')
@@ -580,12 +610,20 @@ function mkImg(u){
 }
 function mkVideo(url,ar){
     ar=ar||'16/9';var su=safeUrl(url);var d=document.createElement('div');
+    // 用代理URL播放，绕过CDN防盗链
+    var proxyUrl='/api/proxy-video?url='+encodeURIComponent(url);
     var w=document.createElement('div');w.className='video-wrapper';w.style.aspectRatio=ar;
-    var v=document.createElement('video');v.src=url;v.controls=true;v.playsInline=true;v.preload='metadata';
-    v.onerror=function(){var e=document.createElement('div');e.className='video-error';e.innerHTML='<div>⚠️ 视频加载失败</div><a href="'+url+'" target="_blank" style="color:#667eea;font-size:12px">点击打开链接</a>';w.appendChild(e)};
+    var v=document.createElement('video');v.src=proxyUrl;v.controls=true;v.playsInline=true;v.preload='auto';
+    v.onerror=function(){
+        // 代理也失败，尝试直接用原始URL
+        if(v.src.indexOf('proxy-video')>=0){v.src=url;return}
+        var e=document.createElement('div');e.className='video-error';
+        e.innerHTML='<div>⚠️ 视频加载失败</div><a href="'+url+'" target="_blank" style="color:#667eea;font-size:12px">点击打开原始链接</a>';
+        w.appendChild(e);
+    };
     w.appendChild(v);d.appendChild(w);
     var acts=document.createElement('div');acts.className='video-actions';
-    acts.innerHTML='<a href="'+url+'" target="_blank">⬇️ 下载</a><button onclick="navigator.clipboard.writeText(\''+su+'\');alert(\'已复制URL\')">📋 复制URL</button>';
+    acts.innerHTML='<a href="'+proxyUrl+'" download="video.mp4">⬇️ 下载</a><a href="'+url+'" target="_blank">🔗 原始链接</a><button onclick="navigator.clipboard.writeText(\''+su+'\');alert(\'已复制URL\')">📋 复制URL</button>';
     d.appendChild(acts);return d;
 }
 
